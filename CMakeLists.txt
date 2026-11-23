@@ -43,3 +43,10 @@ set_source_files_properties(src/platform_win.cpp src/media.cpp src/midi.cpp PROP
 target_link_libraries(Amethyst PRIVATE SDL2::SDL2main SDL2::SDL2 GLEW::GLEW OpenGL::GL projectM4 spout
   ole32 shell32 uuid shlwapi winmm ws2_32 iphlpapi mf mfplat mfreadwrite mfuuid propsys)
 target_link_options(Amethyst PRIVATE -static-libgcc -static-libstdc++)
+
+# Offline test bench for tempo + song-structure detection (not shipped)
+add_executable(amethyst-analyze tools/analyze.cpp src/tempo.cpp src/structure.cpp)
+target_include_directories(amethyst-analyze PRIVATE src ${TP}/stb ${TP}/link/include ${TP}/asio/include)
+target_compile_definitions(amethyst-analyze PRIVATE NOMINMAX LINK_PLATFORM_WINDOWS=1 _WIN32_WINNT=0x0A00)
+target_link_libraries(amethyst-analyze PRIVATE ws2_32 iphlpapi winmm)
+target_link_options(amethyst-analyze PRIVATE -static)

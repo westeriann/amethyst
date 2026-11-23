@@ -76,7 +76,7 @@ void MusicStructure::hop(float bass, float lvl, double t, double beat, double bp
 
     // per-beat bass peaks
     long long ib = (long long)std::floor(beat);
-    int slot = (int)posMod((double)ib, 16);
+    int slot = (int)posMod((double)ib, 32);
     if (ringIdx_[slot] != ib) ringIdx_[slot] = ib, ringPeak_[slot] = 0;
     ringPeak_[slot] = std::max(ringPeak_[slot], bassF_);
 
@@ -106,14 +106,21 @@ void MusicStructure::hop(float bass, float lvl, double t, double beat, double bp
     // new song from a sustained tempo change (ignore half/double-time flips)
     if (bpm > 0) {
         if (stableBpm_ <= 0) {
-            if (soundFor_ > 6) stableBpm_ = bpm;
+            // trust the tempo only once it has held for 45 s
+            if (candBpm_ > 0 && std::fabs(bpm / candBpm_ - 1) < 0.02) candFor_ += dt;
+            else candBpm_ = bpm, candFor_ = 0;
+            if (candFor_ >= 45) stableBpm_ = candBpm_;
         } else {
             double r = bpm / stableBpm_;
-            bool off = std::fabs(r - 1) > 0.04 && std::fabs(r - 2) > 0.08 && std::fabs(r - 0.5) > 0.04;
+            bool off = std::fabs(r - 1) > 0.06;
+            for (double q : {2.0, 0.5, 1.5, 2.0 / 3, 4.0 / 3, 0.75})  // beat-clock octave/triplet slips are not new songs
+                if (std::fabs(r / q - 1) < 0.04) off = false;
             if (off) {
-                if ((offBpmFor_ += dt) >= 4) {
+                if ((offBpmFor_ += dt) >= 8) {
                     emit(SongChange, beat, t);
-                    stableBpm_ = bpm;
+                    stableBpm_ = 0;
+                    candFor_ = 0;
+                    songBeat_ = beat;
                     offBpmFor_ = 0;
                     anchored_ = false;
                 }
@@ -125,11 +132,11 @@ void MusicStructure::hop(float bass, float lvl, double t, double beat, double bp
     }
 
     // drop: the bass comes back far above everything in the previous two bars
-    if (beat - songBeat_ >= 8 && (sec_ != Drop || beat - secBeat_ >= 16)) {
+    if (beat - songBeat_ >= 16 && (sec_ != Drop || beat - secBeat_ >= 32)) {
         float prev = 0;
         bool full = true;
-        for (long long b = ib - 8; b < ib; b++) {
-            int k = (int)posMod((double)b, 16);
+        for (long long b = ib - 8; b < ib; b++) {  // two bars without real bass before it
+            int k = (int)posMod((double)b, 32);
             if (ringIdx_[k] != b) { full = false; break; }
             prev = std::max(prev, ringPeak_[k]);
         }
@@ -148,11 +155,11 @@ void MusicStructure::hop(float bass, float lvl, double t, double beat, double bp
     if (!low) {
         if (bassM_ < bassRef_ * 0.35f && lvl >= kQuiet) {
             if (lowSince_ < 0) lowSince_ = beat;
-            if (beat - lowSince_ >= 4 && sec_ != Intro) {
+            if (beat - lowSince_ >= 8 && sec_ != Intro) {  // two bars: short gaps and fills are not breakdowns
                 // the bass actually stopped on the first quiet beat (the smoothed level lags behind)
                 long long st = (long long)std::floor(lowSince_);
                 for (long long b = st; b > ib - 12; b--) {
-                    int k = (int)posMod((double)b, 16);
+                    int k = (int)posMod((double)b, 32);
                     if (ringIdx_[k] != b || ringPeak_[k] >= bassRef_ * 0.5f) break;
                     st = b;
                 }

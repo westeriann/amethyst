@@ -10,7 +10,9 @@
 namespace {
 constexpr int kHop = 480;           // 10 ms at 48 kHz -> 100 Hz onset envelope
 constexpr double kHopSec = 0.01;
-constexpr int kHistory = 1024;      // ~10 s of envelope
+constexpr int kHistory = 1500;      // 15 s of onset envelope
+constexpr double kMinBpm = 70, kStep = 0.25;
+constexpr int kBins = (int)((190 - kMinBpm) / kStep) + 1;  // 70..190 BPM
 constexpr double kQuantum = 4.0;    // beats per bar for Link phase
 }  // namespace
 
@@ -24,10 +26,12 @@ struct Tempo::Impl {
     int head = 0, filled = 0;
     double lastHopTime = 0;
     int hopCount = 0;
-    double hopEnergy = 0, lp = 0, prevLog = 0;
+    double eLow = 0, eMid = 0, eHigh = 0, lpLow = 0, lpMid = 0, lpHigh = 0, prevL[3] = {0, 0, 0};
     double lastEstimate = 0;
     double pendingBpm = 0;
     int pendingVotes = 0;
+    bool locked = false;
+    std::vector<double> acc;  // accumulated tempo scores
 
     std::vector<double> taps;
 
@@ -41,62 +45,93 @@ struct Tempo::Impl {
     }
     float odAt(int back) const { return od[(head - 1 - back + kHistory * 4) % kHistory]; }
 
+    // Tempo: autocorrelate the onset envelope, score every candidate BPM by how well its 1..4 beat lags
+    // (and the half-beat) line up, accumulate the scores over ~8 s and only switch on sustained evidence.
     void estimate(double now) {
-        if (filled < 500) return;
+        if (filled < 400) return;
         const int n = std::min(filled, kHistory);
         std::vector<float> x(n);
         double mean = 0;
         for (int i = 0; i < n; i++) { x[i] = odAt(n - 1 - i); mean += x[i]; }
         mean /= n;
         for (auto& v : x) v = (float)(v - mean);
-        const int minLag = 33, maxLag = 92;  // ~182 .. 65 BPM
-        std::vector<double> score(maxLag + 2, 0.0);
-        double best = -1e9, sum = 0;
-        int bestLag = 50;
-        for (int L = minLag; L <= maxLag + 1; L++) {
+        const int maxL = std::min(n - 50, 360);
+        std::vector<double> acf(maxL + 2, 0.0);
+        for (int L = 1; L <= maxL + 1 && L < n; L++) {
             double s = 0;
             for (int i = L; i < n; i++) s += x[i] * x[i - L];
-            // also reward the double period (bars feel stronger than beats)
-            if (2 * L < n) for (int i = 2 * L; i < n; i += 2) s += 0.5 * x[i] * x[i - 2 * L];
-            score[L] = s;
+            acf[L] = s / (n - L);
         }
-        for (int L = minLag; L <= maxLag; L++) {
-            double w = std::exp(-0.5 * std::pow(std::log2(L / 50.0) / 0.9, 2));  // prefer ~120 BPM
-            double s = score[L] * w;
-            sum += std::max(0.0, s);
-            if (s > best) { best = s; bestLag = L; }
+        auto A = [&](double L) {
+            int a = (int)L;
+            if (a < 1 || a + 1 > maxL + 1) return 0.0;
+            double k = L - a;
+            return acf[a] * (1 - k) + acf[a + 1] * k;
+        };
+        if (acc.empty()) acc.assign(kBins, 0.0);
+        std::vector<double> sc(kBins);
+        double mx = 1e-12;
+        for (int i = 0; i < kBins; i++) {
+            double b = kMinBpm + i * kStep, P = 6000.0 / b;
+            double s = A(P) + 0.8 * A(2 * P) + 0.6 * A(3 * P) + 0.6 * A(4 * P) + 0.5 * A(P / 2) - 0.3 * A(P * 1.5) - 0.4 * A(P * 2 / 3) - 0.3 * A(P / 3) - 0.25 * A(P * 4 / 3);
+            sc[i] = std::max(0.0, s);
+            mx = std::max(mx, sc[i]);
         }
-        double avg = sum / (maxLag - minLag + 1);
-        confidence = (float)(avg > 0 ? std::min(10.0, best / avg) : 0);
-        if (best <= 0 || confidence < 1.6) return;
-        // parabolic refinement
-        double a = score[bestLag - 1], b = score[bestLag], c = score[bestLag + 1];
-        double denom = a - 2 * b + c;
-        double lag = bestLag + (std::fabs(denom) > 1e-9 ? 0.5 * (a - c) / denom : 0);
-        double found = 60.0 / (lag * kHopSec);
+        double sum = 0;
+        int best = 0;
+        for (int i = 0; i < kBins; i++) {
+            acc[i] = acc[i] * 0.96 + sc[i] / mx;
+            sum += acc[i];
+        }
+        auto prior = [](double b) { double d = std::log2(b / 140.0); return std::exp(-0.5 * d * d / (0.6 * 0.6)); };
+        double bestV = -1;
+        for (int i = 0; i < kBins; i++) {
+            double v = acc[i] * prior(kMinBpm + i * kStep);
+            if (v > bestV) { bestV = v; best = i; }
+        }
+        // refine
+        double off = 0;
+        if (best > 0 && best < kBins - 1) {
+            double a = acc[best - 1], b = acc[best], c = acc[best + 1], d = a - 2 * b + c;
+            if (std::fabs(d) > 1e-12) off = std::clamp(0.5 * (a - c) / d, -0.5, 0.5);
+        }
+        double found = kMinBpm + (best + off) * kStep;
+        double avg = sum / kBins;
+        confidence = (float)(avg > 0 ? std::min(10.0, acc[best] / avg) : 0);
+        if (confidence < 1.5) return;
+        auto valueAt = [&](double b) {
+            int i = (int)std::lround((b - kMinBpm) / kStep);
+            return i >= 0 && i < kBins ? acc[i] * prior(b) : 0.0;
+        };
+        if (std::fabs(found - bpm) / bpm < 0.02) {
+            setTempoKeepPhase(bpm + (found - bpm) * 0.3, now);
+            pendingVotes = 0;
+        } else if (valueAt(found) > valueAt(bpm) * 1.3 || !locked) {
+            if (pendingBpm > 0 && std::fabs(found - pendingBpm) / pendingBpm < 0.02) {
+                if (++pendingVotes >= (locked ? 10 : 2)) { setTempoKeepPhase(found, now); pendingVotes = 0; pendingBpm = 0; locked = true; }
+            } else {
+                pendingBpm = found;
+                pendingVotes = 1;
+            }
+        }
 
-        if (std::fabs(found - bpm) / bpm < 0.04) {
-            setTempoKeepPhase(bpm * 0.85 + found * 0.15, now);
-        } else if (pendingBpm > 0 && std::fabs(found - pendingBpm) / pendingBpm < 0.04) {
-            if (++pendingVotes >= 3) { setTempoKeepPhase(found, now); pendingVotes = 0; pendingBpm = 0; }
-        } else {
-            pendingBpm = found;
-            pendingVotes = 1;
-        }
-
-        // phase: which offset inside one period lines up with the onsets?
-        const double period = 60.0 / bpm / kHopSec;
-        int bestOff = 0;
-        double bestSum = -1;
-        for (int o = 0; o < (int)period; o++) {
-            double s = 0;
-            for (double k = o; k < n; k += period) s += odAt((int)k);
+        // phase: comb over the last ~6 s, recent onsets weigh more
+        const double period = 6000.0 / bpm;
+        const int span = std::min(n, 600);
+        double bestSum = -1, bestOff = 0;
+        for (double o = 0; o < period; o += 0.5) {
+            double s = 0, w = 1;
+            for (double k = o; k < span - 1; k += period, w *= 0.93) {
+                int a = (int)k;
+                double f = k - a;
+                s += w * (odAt(a) * (1 - f) + odAt(a + 1) * f);
+            }
             if (s > bestSum) { bestSum = s; bestOff = o; }
         }
         double lastBeatTime = lastHopTime - bestOff * kHopSec;
         double cur = beatAt(lastBeatTime);
         double err = cur - std::round(cur);
-        anchorBeat -= err * 0.5;  // ease the phase towards the detected beat
+        anchorBeat -= err * 0.35;  // ease the phase towards the detected beat
     }
 };
 
@@ -112,16 +147,23 @@ void Tempo::feed(const float* s, size_t frames, double now) {
     size_t hopIndex = 0;
     for (size_t i = 0; i < frames; i++) {
         float m = 0.5f * (s[2 * i] + s[2 * i + 1]);
-        I.lp += (m - I.lp) * 0.025;
-        I.hopEnergy += I.lp * I.lp + 0.15 * m * m;
+        I.lpLow += (m - I.lpLow) * 0.0194;   // ~150 Hz
+        I.lpMid += (m - I.lpMid) * 0.23;     // ~2 kHz
+        I.lpHigh += (m - I.lpHigh) * 0.48;   // ~5 kHz
+        double lo = I.lpLow, mi = I.lpMid - I.lpLow, hi = m - I.lpHigh;
+        I.eLow += lo * lo, I.eMid += mi * mi, I.eHigh += hi * hi;
         if (++I.hopCount >= kHop) {
-            double lg = std::log10(1e-7 + I.hopEnergy / kHop);
-            float v = (float)std::max(0.0, lg - I.prevLog);
-            I.prevLog = lg;
-            I.od[I.head] = v;
+            // band-wise log-energy flux (rises only): kicks, snares and hats all count
+            double e[3] = {I.eLow, I.eMid, I.eHigh}, w[3] = {1.0, 0.8, 0.6}, v = 0;
+            for (int b = 0; b < 3; b++) {
+                double lg = std::log10(1e-9 + e[b] / kHop);
+                v += w[b] * std::max(0.0, lg - I.prevL[b]);
+                I.prevL[b] = lg;
+            }
+            I.eLow = I.eMid = I.eHigh = 0;
+            I.od[I.head] = (float)v;
             I.head = (I.head + 1) % kHistory;
             I.filled = std::min(I.filled + 1, kHistory);
-            I.hopEnergy = 0;
             I.hopCount = 0;
             hopIndex++;
             I.lastHopTime = now - (double)(totalHops - hopIndex) * kHopSec;

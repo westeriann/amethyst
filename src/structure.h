@@ -38,8 +38,9 @@ private:
     double silentFor_ = 0, soundFor_ = 0, lowSince_ = -1, songBeat_ = 0;
     // tempo
     double stableBpm_ = 0, bpmSince_ = 0, offBpmFor_ = 0;
-    float ringPeak_[16] = {};  // per-beat bass peaks
-    long long ringIdx_[16] = {-9, -9, -9, -9, -9, -9, -9, -9, -9, -9, -9, -9, -9, -9, -9, -9};
+    float ringPeak_[32] = {};  // per-beat bass peaks
+    long long ringIdx_[32] = {};
+    double candBpm_ = 0, candFor_ = 0;
     // hop accumulator
     double accB_ = 0, accA_ = 0;
     int accN_ = 0;
