@@ -14,6 +14,8 @@ public:
     void tap(double now);
     void setBpm(double bpm, double now);
     void nudge(double beats);
+    // Forget everything heard so far (rendering a file). bpmHint > 0 locks that tempo from the start.
+    void restart(double bpmHint);
     // Beat clock fed from outside (DJ software/hardware): bpm and the beat position at time `now`.
     void setExternal(double bpm, double beat, double now);
 

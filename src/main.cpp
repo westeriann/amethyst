@@ -22,6 +22,7 @@
 #include "platform.h"
 #include "player.h"
 #include "preset_editor.h"
+#include <miniaudio/miniaudio.h>
 #include "structure.h"
 #include "remote_page.h"
 #include "stagelinq.h"
@@ -309,6 +310,27 @@ double beatsToSec(double beats);
 void panicSafe();
 void startXfade(float to, double dur);
 MusicStructure structure;
+extern std::string selftestDir;
+void testNote(const std::string& s);
+// Render an audio file to video, offline and frame-perfect.
+struct RenderJob {
+    bool active = false, cancel = false, feedNow = false, useAuto = true;
+    std::vector<float> pcm;  // 48 kHz stereo
+    size_t pos = 0;
+    int fps = 60, w = 1920, h = 1080;
+    std::string src, out;
+    double carry = 0, bpm = 0, wallStart = 0;
+    long long frame = 0, total = 0;
+    std::vector<float> chunk;
+    std::vector<unsigned char> pixels;
+    // settings restored afterwards
+    bool sAutoOn = false, sSmart = true, sAutoFx = true, sWatchdog = true;
+    int sTempoSource = 0;
+    // result for the UI / self-test
+    std::string lastOut, lastErr;
+    double lastSecs = 0, lastWall = 0;
+    long long lastFrames = 0;
+} rj;
 // custom shader effects (ShaderToy-style .glsl files)
 struct UserShader {
     std::string name, path, err;
@@ -337,7 +359,11 @@ char tagBuf[128] = "", setlistNameBuf[64] = "";
 struct Toast { std::string text; double until; bool err; };
 std::vector<Toast> toasts;
 
-double now() { return SDL_GetPerformanceCounter() / (double)SDL_GetPerformanceFrequency(); }
+// The clock can be driven by the file renderer (one video frame per step); afterwards it carries on
+// from where the render left it, so every timestamp stays monotonic.
+double clockOverride = -1, clockOffset = 0;
+double realNow() { return SDL_GetPerformanceCounter() / (double)SDL_GetPerformanceFrequency(); }
+double now() { return clockOverride >= 0 ? clockOverride : realNow() + clockOffset; }
 
 void toast(bool err, const char* fmt, ...) {
     char buf[512];
@@ -979,7 +1005,14 @@ void setGain(float g) {
 
 bool pumpAudio() {
     static std::vector<float> buf(48000 * 2);
-    size_t n = audio.read(buf.data(), 24000);
+    size_t n;
+    if (rj.active) {  // the renderer hands over exactly one video frame of the file's audio
+        if (!rj.feedNow || rj.chunk.empty()) return false;
+        n = rj.chunk.size() / 2;
+        std::copy(rj.chunk.begin(), rj.chunk.end(), buf.begin());
+    } else {
+        n = audio.read(buf.data(), 24000);
+    }
     double t = now();
     if (n == 0) {
         level *= 0.9f;
@@ -1121,7 +1154,7 @@ void stopRecording() {
 RenderTarget recRT;  // fixed recording size, so resizing outputs never interrupts a take
 
 void captureForRecording(double dt) {
-    if (!recorder.active()) return;
+    if (!recorder.active() || rj.active) return;  // the file renderer captures its own frames
     recAccum += dt;
     double frame = 1.0 / S.recFps;
     if (recAccum < frame) return;
@@ -1535,6 +1568,7 @@ void setDjLink(bool on) {
     toast(false, on ? "DJ link on — searching for Engine OS devices" : "DJ link off");
 }
 void updateDjLink(double t) {
+    if (rj.active) return;  // the file being rendered is the only music
     if (!S.djOn) return;
     djSnap = djLink.snapshot();
     int on = StageLinq::onAirDeck(djSnap);
@@ -2262,6 +2296,186 @@ void drawOverlays(RenderTarget& rt, double t) {
 }
 
 // ===================================================================== render pipeline
+bool decodeAudioFile(const std::string& path, std::vector<float>& out, std::string& err) {
+    ma_decoder_config cfg = ma_decoder_config_init(ma_format_f32, 2, 48000);
+    ma_decoder dec;
+    if (ma_decoder_init_file(path.c_str(), &cfg, &dec) != MA_SUCCESS) { err = "unsupported or unreadable audio file"; return false; }
+    out.clear();
+    std::vector<float> b(8192 * 2);
+    ma_uint64 got = 0;
+    while (ma_decoder_read_pcm_frames(&dec, b.data(), 8192, &got) == MA_SUCCESS && got > 0) out.insert(out.end(), b.begin(), b.begin() + got * 2);
+    ma_decoder_uninit(&dec);
+    if (out.empty()) { err = "the file has no audio"; return false; }
+    return true;
+}
+
+// Listen to the whole file first so the beat grid is right from the first frame.
+double prescanTempo(const std::vector<float>& pcm) {
+    Tempo t;
+    double tt = 0;
+    for (size_t i = 0; i + 960 <= pcm.size(); i += 960) {
+        tt += 0.01;
+        t.feed(&pcm[i], 480, tt);
+        t.update(tt);
+    }
+    return t.confidence() > 1.5f ? t.bpm() : 0;
+}
+
+void finishRenderJob(bool cancelled) {
+    recorder.stop();
+    rj.lastOut = rj.out;
+    rj.lastFrames = rj.frame;
+    rj.lastSecs = rj.frame / (double)rj.fps;
+    rj.lastWall = realNow() - rj.wallStart;
+    rj.active = false;
+    clockOffset = clockOverride - realNow();
+    clockOverride = -1;
+    S.autoOn = rj.sAutoOn, S.smartMix = rj.sSmart, S.autoFx = rj.sAutoFx, S.watchdog = rj.sWatchdog;
+    tempo.restart(0);
+    tempo.setSource((Tempo::Source)rj.sTempoSource);
+    structure = MusicStructure();
+    rj.pcm.clear();
+    rj.pcm.shrink_to_fit();
+    std::vector<float> drain(48000);
+    while (audio.read(drain.data(), 24000) > 0) {}  // skip the live audio that piled up meanwhile
+    if (cancelled) toast(true, "Render cancelled — kept the first %d:%02d in %s", (int)rj.lastSecs / 60, (int)rj.lastSecs % 60, rj.out.c_str());
+    else toast(false, "Rendered %d:%02d of video in %.0f s -> %s", (int)rj.lastSecs / 60, (int)rj.lastSecs % 60, rj.lastWall, rj.out.c_str());
+}
+
+bool startRenderJob(std::vector<float> pcm, const std::string& src, const std::string& out, int w, int h, int fps, bool useAuto) {
+    if (rj.active || recorder.active()) { toast(true, "Stop the current recording first"); return false; }
+    std::error_code ec;
+    fs::create_directories(fs::u8path(out).parent_path(), ec);
+    std::string err;
+    if (!recorder.start(out, w, h, fps, err, true)) { rj.lastErr = err; toast(true, "Render failed: %s", err.c_str()); return false; }
+    rj = RenderJob{};
+    rj.pcm = std::move(pcm);
+    rj.src = src, rj.out = out, rj.w = recorder.width(), rj.h = recorder.height(), rj.fps = fps, rj.useAuto = useAuto;
+    rj.total = (long long)((rj.pcm.size() / 2) / 48000.0 * fps) + fps;  // plus a second of tail
+    rj.sAutoOn = S.autoOn, rj.sSmart = S.smartMix, rj.sAutoFx = S.autoFx, rj.sWatchdog = S.watchdog;
+    rj.sTempoSource = (int)tempo.source();
+    if (useAuto) S.autoOn = true, S.smartMix = true, S.autoFx = true;
+    S.watchdog = false;
+    rj.bpm = prescanTempo(rj.pcm);
+    tempo.setSource(Tempo::Source::Auto);
+    tempo.restart(rj.bpm);
+    structure = MusicStructure();
+    smart = Smart{};
+    afx = AutoFx{};
+    clockOverride = now();
+    rj.wallStart = realNow();
+    rj.active = true;
+    return true;
+}
+
+// One step per main-loop pass. Returns true when this pass advances the video by one frame.
+bool renderJobStep() {
+    rj.feedNow = false;
+    if (!rj.active) return false;
+    if (rj.cancel) { finishRenderJob(true); return false; }
+    // let presets finish compiling (no frame is ever skipped), but never wait more than 3 s on one
+    static double waitSince = -1;
+    if (anyLoading()) {
+        if (waitSince < 0) waitSince = realNow();
+        static double lastNote = 0;
+        if (!selftestDir.empty() && realNow() - lastNote > 1) lastNote = realNow(), testNote("render waiting: A=" + std::to_string(decks[0].pendingIdx) + " B=" + std::to_string(decks[1].pendingIdx) + " spareLoadingB=" + std::to_string(decks[1].spare().loading()));
+        if (realNow() - waitSince < 3) return false;
+    }
+    waitSince = -1;
+    if (rj.frame >= rj.total) { finishRenderJob(false); return false; }
+    rj.carry += 48000.0 / rj.fps;
+    size_t n = (size_t)rj.carry;
+    rj.carry -= n;
+    rj.chunk.assign(n * 2, 0.f);
+    for (size_t i = 0; i < n * 2 && rj.pos + i < rj.pcm.size(); i++) rj.chunk[i] = rj.pcm[rj.pos + i];
+    rj.pos += n * 2;
+    clockOverride += 1.0 / rj.fps;
+    rj.feedNow = true;
+    return true;
+}
+
+void captureRenderFrame() {
+    rj.pixels.resize((size_t)rj.w * rj.h * 4);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, finalRT.fbo);
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    glReadPixels(0, 0, rj.w, rj.h, GL_BGRA, GL_UNSIGNED_BYTE, rj.pixels.data());
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    double t0 = realNow();
+    recorder.pushFrame(rj.pixels.data(), rj.chunk.data(), rj.chunk.size() / 2);
+    if (!selftestDir.empty() && realNow() - t0 > 0.2) testNote("pushFrame blocked " + std::to_string(realNow() - t0) + " s at frame " + std::to_string(rj.frame));
+    rj.frame++;
+}
+
+// ---- UI: pick a file, choose size, watch progress
+bool renderDialogOpen = false;
+std::string renderTestOut;
+std::string renderPick;
+std::vector<float> renderPickPcm;
+int renderRes = 1, renderFps = 1;
+bool renderUseAuto = true;
+char renderOut[1024] = "";
+const int kRenderRes[][2] = {{1280, 720}, {1920, 1080}, {2560, 1440}, {3840, 2160}};
+const char* kRenderResNames[] = {"720p", "1080p", "1440p", "4K"};
+
+void openRenderDialog() {
+    auto files = plat::pickFiles(hwndOf(win), L"Render an audio file to video",
+                                 {{L"Audio", L"*.wav;*.flac;*.mp3;*.ogg"}, {L"All files", L"*.*"}}, false);
+    if (files.empty()) return;
+    std::string err;
+    if (!decodeAudioFile(files[0], renderPickPcm, err)) { toast(true, "%s: %s", fs::u8path(files[0]).filename().u8string().c_str(), err.c_str()); return; }
+    renderPick = files[0];
+    std::string o = plat::videosDir() + "\\Amethyst\\" + fs::u8path(files[0]).stem().u8string() + " (Amethyst).mp4";
+    snprintf(renderOut, sizeof renderOut, "%s", o.c_str());
+    renderDialogOpen = true;
+}
+
+void drawRenderWindow() {
+    if (!renderDialogOpen && !rj.active) return;
+    ImGui::SetNextWindowSize(ImVec2(520, 0), ImGuiCond_Always);
+    bool open = true;
+    if (!ImGui::Begin("Render audio to video", rj.active ? nullptr : &open, ImGuiWindowFlags_NoCollapse)) { ImGui::End(); return; }
+    if (!open) renderDialogOpen = false;
+    if (rj.active) {
+        float p = rj.total ? (float)rj.frame / rj.total : 0;
+        double wall = realNow() - rj.wallStart, speed = wall > 0 ? (rj.frame / (double)rj.fps) / wall : 0;
+        ImGui::TextUnformatted(fs::u8path(rj.src).filename().u8string().c_str());
+        ImGui::ProgressBar(p, ImVec2(-1, 0));
+        ImGui::Text("%lld / %lld frames   %.1fx real time   about %.0f s left   %s  %.0f BPM", rj.frame, rj.total, speed,
+                    speed > 0 ? (rj.total - rj.frame) / (double)rj.fps / speed : 0.0, MusicStructure::name(structure.section()), tempo.bpm());
+        if (ImGui::Button("Cancel")) rj.cancel = true;
+    } else {
+        ImGui::TextUnformatted(fs::u8path(renderPick).filename().u8string().c_str());
+        double secs = renderPickPcm.size() / 2 / 48000.0;
+        ImGui::TextDisabled("%d:%02d of audio", (int)secs / 60, (int)secs % 60);
+        ImGui::SetNextItemWidth(120);
+        ImGui::Combo("Size", &renderRes, kRenderResNames, 4);
+        ImGui::SameLine();
+        static const char* fpsNames[] = {"30 fps", "60 fps"};
+        ImGui::SetNextItemWidth(100);
+        ImGui::Combo("##fps", &renderFps, fpsNames, 2);
+        ImGui::Checkbox("Let smart auto-mix + Auto FX run the show", &renderUseAuto);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Off: renders exactly what you have set up now (presets, effects, auto settings).");
+        ImGui::SetNextItemWidth(-90);
+        ImGui::InputText("##out", renderOut, sizeof renderOut);
+        ImGui::SameLine();
+        if (ImGui::Button("Change...")) {
+            auto o = plat::pickSaveFile(hwndOf(win), L"Save video as", {{L"MP4 video", L"*.mp4"}}, fs::u8path(renderOut).filename().u8string(), L"mp4");
+            if (!o.empty()) snprintf(renderOut, sizeof renderOut, "%s", o.c_str());
+        }
+        ImGui::TextDisabled("Renders offline: every frame is kept, the music is added to the video.");
+        if (ImGui::Button("Render", ImVec2(120, 0))) {
+            if (startRenderJob(std::move(renderPickPcm), renderPick, renderOut, kRenderRes[renderRes][0], kRenderRes[renderRes][1],
+                               renderFps ? 60 : 30, renderUseAuto))
+                renderDialogOpen = false;
+        }
+        if (!rj.lastOut.empty()) {
+            ImGui::SameLine();
+            if (ImGui::Button("Open last video")) plat::openPath(rj.lastOut);
+        }
+    }
+    ImGui::End();
+}
+
 std::string userShaderDir() { return plat::documentsDir() + "\\Amethyst\\Shaders"; }
 long long fileStamp(const std::string& p) {
     std::error_code ec;
@@ -2332,6 +2546,7 @@ void renderFrame(double t, double dt) {
     float sc = kQuality[S.quality].scale;
     w = std::max(16, (int)(w * sc)) & ~1;
     h = std::max(16, (int)(h * sc)) & ~1;
+    if (rj.active) w = rj.w, h = rj.h;  // the file renderer picks the size
     if (w != renderW || h != renderH) {
         renderW = w;
         renderH = h;
@@ -2342,7 +2557,10 @@ void renderFrame(double t, double dt) {
     bool needB = modOut.xfade > 0.001f || S.mixMode != MixCrossfade || S.showMixer || xanim.active || smart.peeking;
     for (auto& o : outputs) needB |= o.source == 2;
     for (int d = 0; d < 2; d++) {
-        if (d == 1 && !needB) continue;
+        if (d == 1 && !needB) {  // hidden: only warm up a preset that is loading, so the load can finish
+            if (decks[1].spare().loading()) decks[1].spare().requestFrame(decks[1].time, w, h);
+            continue;
+        }
         Deck& dk = decks[d];
         if (!frozen) {
             dk.time += dt * S.speed;
@@ -3356,6 +3574,7 @@ void drawMenuBar() {
         ImGui::Separator();
         if (ImGui::MenuItem("Spout sender (to OBS, Resolume...)", "F12", S.spout)) setSpout(!S.spout);
         if (ImGui::MenuItem(recorder.active() ? "Stop recording" : "Record to MP4", "F9", recorder.active())) actions.invoke("record", true);
+        if (ImGui::MenuItem("Render audio file to video...", nullptr, false, !rj.active && !recorder.active())) openRenderDialog();
         if (ImGui::BeginMenu("Recording frame rate")) {
             for (int f : {24, 30, 60})
                 if (ImGui::MenuItem((std::to_string(f) + " fps").c_str(), nullptr, S.recFps == f, !recorder.active())) S.recFps = f;
@@ -4807,6 +5026,7 @@ void drawUi() {
         if (S.showControl) drawControl();
         if (S.showSetlists) drawSetlists();
         if (editorOpen) drawEditor();
+        drawRenderWindow();
         if (keyboardOpen) drawKeyboard();
         if (S.showScenes) drawScenes();
         if (S.showMod) drawModulation();
@@ -5084,9 +5304,33 @@ void buildPerfTest() {
     at(0.5, [] { running = false; });
 }
 
+void testRenderStart() {  // render 10 s of a synthetic 128 BPM track to a 640x360 video with audio
+        std::vector<float> pcm(48000 * 10 * 2);
+        for (size_t i = 0; i < pcm.size() / 2; i++) {
+            double tt = i / 48000.0, ph = std::fmod(tt, 60.0 / 128);
+            float v = (float)(0.7 * std::sin(2 * M_PI * 55 * ph) * std::exp(-ph / 0.12) + 0.05 * std::sin(2 * M_PI * 440 * tt));
+            pcm[i * 2] = pcm[i * 2 + 1] = v;
+        }
+        renderTestOut = selftestDir + "\\render-test.mp4";
+        bool ok = startRenderJob(std::move(pcm), "synthetic", renderTestOut, 640, 360, 30, true);
+        testNote(std::string("render started=") + (ok ? "yes" : "no") + " prescan bpm=" + std::to_string(rj.bpm));
+    }
+void testRenderCheck() {  // virtual seconds: the clock follows the render
+        std::error_code ec;
+        auto size = fs::file_size(fs::u8path(renderTestOut), ec);
+        testNote("render done: active=" + std::to_string(rj.active) + " frames=" + std::to_string(rj.lastFrames) + " (expected 330) video secs=" +
+                 std::to_string(rj.lastSecs) + " wall=" + std::to_string(rj.lastWall) + " size=" + std::to_string(ec ? 0 : size) + " " + rj.lastErr);
+    }
+bool renderTestOnly = false;
 void buildSelftest() {
     double t = 2.5;
     auto at = [&](double dt, std::function<void()> f) { t += dt; testSteps.push_back({t, std::move(f)}); };
+    if (renderTestOnly) {
+        at(0.5, [] { testRenderStart(); });
+        at(12.5, [] { testRenderCheck(); });
+        at(0.5, [] { running = false; });
+        return;
+    }
     at(0, [] { testNote("presets=" + std::to_string(lib.size()) + " A=" + curName(0) + " audio=" + audio.label() + " sources=" + std::to_string(sourceNames.size())); pendingShot = "01-start"; });
     // smart auto-mix: synthetic 128 BPM tracks -> groove 16 bars, breakdown 8 bars, drop 16 bars, silence;
     // the second one has a fakeout: one bar of drop, one bar without bass, then the real drop at beat 104
@@ -5393,6 +5637,8 @@ void buildSelftest() {
         S.safePreset = lib[decks[onAirDeck()].cur].path;
     });
     at(0.5, [] { go(onAirDeck(), 1, true, true); });
+    at(0.5, [] { testRenderStart(); });
+    at(13.0, [] { testRenderCheck(); });  // virtual seconds: the clock follows the render
     at(0.5, [] {  // custom shaders: every bundled one must compile
         scanShaders();
         int ok = 0;
@@ -5479,6 +5725,7 @@ int main(int argc, char** argv) {
         else if (a == "--perftest" && i + 1 < argc) { selftestDir = argv[++i]; perfMode = true; }
         else if (a == "--add-folder" && i + 1 < argc) extraFolder = argv[++i];
         else if (a == "--recovered") recoveredStart = true;
+        else if (a == "--rendertest" && i + 1 < argc) { selftestDir = argv[++i]; renderTestOnly = true; }
     }
     if (selftestDir.empty()) migrateLegacy();
     std::string base = selftestDir.empty() ? plat::appDataDir() : selftestDir;
@@ -5693,6 +5940,7 @@ int main(int argc, char** argv) {
         osc.poll(handleRemote);
         web.poll(handleHttp);
 
+        bool rjAdvance = renderJobStep();
         const double t = now();
         const double dt = std::clamp(t - last, 0.0, 0.25);
         if (perfMode) perfFrames.push_back((t - last) * 1000.0);
@@ -5752,7 +6000,8 @@ int main(int argc, char** argv) {
         SDL_GL_MakeCurrent(win, ctx);
         commitLoads();
         renderFrame(t, dt);
-        watchdogTick(t, dt);
+        if (rjAdvance) captureRenderFrame();
+        if (!rj.active) watchdogTick(t, dt);
         {
             static double lastSave = t;
             if (selftestDir.empty() && t - lastSave > 60) { lastSave = t; saveSettings(); }  // a crash loses little
@@ -5763,7 +6012,7 @@ int main(int argc, char** argv) {
         // control window
         int cw, ch;
         SDL_GL_GetDrawableSize(win, &cw, &ch);
-        SDL_GL_SetSwapInterval(outputs.empty() ? 1 : 0);
+        SDL_GL_SetSwapInterval(outputs.empty() && !rj.active ? 1 : 0);  // rendering a file runs as fast as it can
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glViewport(0, 0, cw, ch);
         glClearColor(0, 0, 0, 1);

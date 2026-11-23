@@ -12,11 +12,12 @@
 class Recorder {
 public:
     ~Recorder() { stop(); }
-    bool start(const std::string& path, int width, int height, int fps, std::string& err);
+    // offline = rendering a file: never drops frames (pushFrame waits) and writes an AAC audio track.
+    bool start(const std::string& path, int width, int height, int fps, std::string& err, bool offline = false);
     void stop();
     bool active() const { return active_; }
     // BGRA rows bottom-up (as glReadPixels returns them). Copied; drops if the encoder falls behind.
-    void pushFrame(const unsigned char* bgra);
+    void pushFrame(const unsigned char* bgra, const float* stereo = nullptr, size_t audioFrames = 0);  // audio: 48 kHz
     double seconds() const { return frames_ / (double)fps_; }
     int dropped() const { return dropped_; }
     const std::string& path() const { return path_; }
@@ -31,7 +32,12 @@ private:
     std::atomic<bool> active_{false}, stopping_{false};
     std::mutex mu_;
     std::condition_variable cv_;
-    std::deque<std::vector<unsigned char>> queue_;
+    struct Item {
+        std::vector<unsigned char> video;
+        std::vector<short> audio;
+    };
+    std::deque<Item> queue_;
+    bool offline_ = false;
     std::vector<std::vector<unsigned char>> pool_;
     std::atomic<long long> frames_{0};
     std::atomic<int> dropped_{0};

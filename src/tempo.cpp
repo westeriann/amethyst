@@ -258,3 +258,16 @@ void Tempo::enableLink(bool on) {
 }
 bool Tempo::linkEnabled() const { return p_->link && p_->link->isEnabled(); }
 int Tempo::linkPeers() const { return p_->link ? (int)p_->link->numPeers() : 0; }
+
+void Tempo::restart(double bpmHint) {
+    Impl& I = *p_;
+    std::fill(I.od.begin(), I.od.end(), 0.f);
+    I.head = I.filled = 0;
+    I.acc.clear();
+    I.pendingBpm = 0, I.pendingVotes = 0, I.confidence = 0;
+    I.eLow = I.eMid = I.eHigh = 0, I.hopCount = 0;
+    I.lastEstimate = 0;
+    I.anchorBeat = 0, I.anchorTime = 0;
+    I.locked = bpmHint > 0;
+    I.bpm = bpmHint > 0 ? bpmHint : 120;
+}

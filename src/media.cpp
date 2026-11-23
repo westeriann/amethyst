@@ -10,6 +10,7 @@
 #include <mfreadwrite.h>
 #include <propvarutil.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 
@@ -36,8 +37,9 @@ double nowSec() {
 }  // namespace
 
 // ================================================================== Recorder
-bool Recorder::start(const std::string& path, int width, int height, int fps, std::string& err) {
+bool Recorder::start(const std::string& path, int width, int height, int fps, std::string& err, bool offline) {
     stop();
+    offline_ = offline;
     w_ = width & ~1;
     h_ = height & ~1;
     fps_ = fps;
@@ -67,19 +69,24 @@ void Recorder::stop() {
     active_ = false;
 }
 
-void Recorder::pushFrame(const unsigned char* bgra) {
+void Recorder::pushFrame(const unsigned char* bgra, const float* stereo, size_t audioFrames) {
     if (!active_ || stopping_) return;
     const size_t size = (size_t)w_ * h_ * 4;
     std::unique_lock<std::mutex> lk(mu_);
-    if (queue_.size() >= 8) { dropped_++; return; }
-    std::vector<unsigned char> buf;
-    if (!pool_.empty()) { buf.swap(pool_.back()); pool_.pop_back(); }
-    buf.resize(size);
+    if (offline_) cv_.wait(lk, [&] { return queue_.size() < 6 || stopping_; });
+    else if (queue_.size() >= 8) { dropped_++; return; }
+    Item it;
+    if (!pool_.empty()) { it.video.swap(pool_.back()); pool_.pop_back(); }
+    it.video.resize(size);
     lk.unlock();
-    memcpy(buf.data(), bgra, size);
+    memcpy(it.video.data(), bgra, size);
+    if (stereo && audioFrames) {
+        it.audio.resize(audioFrames * 2);
+        for (size_t i = 0; i < audioFrames * 2; i++) it.audio[i] = (short)std::max(-32767.f, std::min(32767.f, stereo[i] * 32767.f));
+    }
     lk.lock();
-    queue_.push_back(std::move(buf));
-    cv_.notify_one();
+    queue_.push_back(std::move(it));
+    cv_.notify_all();
 }
 
 void Recorder::run() {
@@ -99,6 +106,7 @@ void Recorder::run() {
     MFCreateAttributes(&attrs, 2);
     attrs->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
     attrs->SetGUID(MF_TRANSCODE_CONTAINERTYPE, MFTranscodeContainerType_MPEG4);
+    if (offline_) attrs->SetUINT32(MF_SINK_WRITER_DISABLE_THROTTLING, TRUE);  // offline: never wait for the streams to line up in real time
     HRESULT hr = MFCreateSinkWriterFromURL(plat::widen(path_).c_str(), nullptr, attrs, &writer);
     release(attrs);
     if (FAILED(hr)) return fail("could not create the video file", hr);
@@ -127,6 +135,32 @@ void Recorder::run() {
     hr = writer->SetInputMediaType(stream, in, nullptr);
     release(in);
     if (FAILED(hr)) return fail("encoder rejected RGB input", hr);
+    DWORD aStream = 0;
+    if (offline_) {  // AAC 192 kbps from 16-bit 48 kHz stereo PCM
+        IMFMediaType *aout = nullptr, *ain = nullptr;
+        MFCreateMediaType(&aout);
+        aout->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+        aout->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
+        aout->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+        aout->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, 48000);
+        aout->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 2);
+        aout->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 24000);
+        hr = writer->AddStream(aout, &aStream);
+        release(aout);
+        if (FAILED(hr)) return fail("AAC encoder rejected the format", hr);
+        MFCreateMediaType(&ain);
+        ain->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+        ain->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
+        ain->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+        ain->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, 48000);
+        ain->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 2);
+        ain->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, 4);
+        ain->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 192000);
+        hr = writer->SetInputMediaType(aStream, ain, nullptr);
+        release(ain);
+        if (FAILED(hr)) return fail("AAC encoder rejected PCM input", hr);
+    }
+    long long audioFrames = 0;
     hr = writer->BeginWriting();
     if (FAILED(hr)) return fail("could not start writing", hr);
     startState_ = 1;
@@ -135,12 +169,36 @@ void Recorder::run() {
     const DWORD size = (DWORD)(w_ * h_ * 4);
     while (true) {
         std::vector<unsigned char> frame;
+        std::vector<short> audio;
         {
             std::unique_lock<std::mutex> lk(mu_);
             cv_.wait(lk, [&] { return !queue_.empty() || stopping_; });
             if (queue_.empty() && stopping_) break;
-            frame.swap(queue_.front());
+            frame.swap(queue_.front().video);
+            audio.swap(queue_.front().audio);
             queue_.pop_front();
+            cv_.notify_all();  // a waiting offline pushFrame may continue
+        }
+        if (offline_ && !audio.empty()) {
+            DWORD bytes = (DWORD)(audio.size() * sizeof(short));
+            IMFMediaBuffer* ab = nullptr;
+            if (SUCCEEDED(MFCreateMemoryBuffer(bytes, &ab))) {
+                BYTE* dst = nullptr;
+                ab->Lock(&dst, nullptr, nullptr);
+                memcpy(dst, audio.data(), bytes);
+                ab->Unlock();
+                ab->SetCurrentLength(bytes);
+                IMFSample* as = nullptr;
+                MFCreateSample(&as);
+                as->AddBuffer(ab);
+                long long n = (long long)audio.size() / 2;
+                as->SetSampleTime(audioFrames * 10000000LL / 48000);
+                as->SetSampleDuration(n * 10000000LL / 48000);
+                if (FAILED(writer->WriteSample(aStream, as))) error = "audio write failed";
+                audioFrames += n;
+                release(as);
+                release(ab);
+            }
         }
         IMFMediaBuffer* mb = nullptr;
         if (SUCCEEDED(MFCreateMemoryBuffer(size, &mb))) {
