@@ -69,7 +69,7 @@ const char* kOutputSources[] = {"Final output", "Deck A", "Deck B", "Mix (before
 struct Settings {
     float blend = 2;
     int interval = 20;
-    bool autoOn = false, shuffle = true, autoDecks = false, smartMix = true;
+    bool autoOn = false, shuffle = true, autoDecks = false, smartMix = true, fakeoutRecut = true;
     int quantize = 2;            // auto-pilot launch grid
     bool quantizeManual = false; // also quantize manual launches
     float gain = 1, speed = 1;
@@ -131,7 +131,7 @@ struct Field { const char* key; char type; void* p; };
 std::vector<Field> fields() {
     return {
         {"blend", 'f', &S.blend}, {"interval", 'i', &S.interval}, {"auto", 'b', &S.autoOn}, {"shuffle", 'b', &S.shuffle},
-        {"auto_decks", 'b', &S.autoDecks}, {"smart_mix", 'b', &S.smartMix}, {"quantize", 'i', &S.quantize}, {"quantize_manual", 'b', &S.quantizeManual},
+        {"auto_decks", 'b', &S.autoDecks}, {"smart_mix", 'b', &S.smartMix}, {"fakeout_recut", 'b', &S.fakeoutRecut}, {"quantize", 'i', &S.quantize}, {"quantize_manual", 'b', &S.quantizeManual},
         {"gain", 'f', &S.gain}, {"speed", 'f', &S.speed}, {"quality", 'i', &S.quality}, {"xfade", 'f', &S.xfade}, {"mix_mode", 'i', &S.mixMode},
         {"show_menu", 'b', &S.showMenu}, {"show_browser", 'b', &S.showBrowser}, {"show_hud", 'b', &S.showHud}, {"show_cues", 'b', &S.showCues},
         {"show_toasts", 'b', &S.showToasts}, {"show_status", 'b', &S.showStatus}, {"show_mixer", 'b', &S.showMixer}, {"show_fx", 'b', &S.showFx},
@@ -560,6 +560,7 @@ void rebuildView() {
             if (match(i)) view.push_back(i);
         if (S.pool.rfind("similar:", 0) == 0) sortSimilar(view);
     }
+    upcoming = -1;  // picked from the old filters: auto-pilot must stay inside the new ones
     int cur = decks[focus].cur;
     auto it = std::find(view.begin(), view.end(), cur);
     sel = it == view.end() ? 0 : (int)(it - view.begin());
@@ -702,7 +703,8 @@ void go(int d, int dir, bool hard, bool random = false) {
     if (view.empty()) { toast(true, query.empty() ? "No presets in this pool — add a folder (Ctrl+Shift+O)" : "No presets match the search"); return; }
     int target;
     if (random) {
-        target = (upcoming >= 0 && upcoming != decks[d].cur && !lib[upcoming].broken) ? upcoming : pickRandom(navBase(d));
+        bool upOk = upcoming >= 0 && upcoming != decks[d].cur && !lib[upcoming].broken && std::find(view.begin(), view.end(), upcoming) != view.end();
+        target = upOk ? upcoming : pickRandom(navBase(d));
         upcoming = -1;
     } else {
         target = stepFrom(navBase(d), dir);
@@ -1655,6 +1657,7 @@ struct Smart {
     double fireBeat = 0, blend = 0;
     bool hard = false;
     double lastSwitch = 0;
+    bool afterFake = false;  // between a fakeout and the real drop
     std::string lastEvent;
     double lastEventAt = -100;
 } smart;
@@ -1746,6 +1749,8 @@ void smartTick(double t) {
         double nextBar = structure.nextBoundary(beat + lead, 1);
         switch (e.type) {
             case MusicStructure::DropHit:
+                if (smart.afterFake && !S.fakeoutRecut) { smart.afterFake = false; break; }  // keep the fake-drop preset
+                smart.afterFake = false;
                 if (smart.prep && smart.fireOn == 1 && smartReady()) smartFire(t);
                 else if (smartPrepare(1, 0, beat, 0, true)) smart.fireBeat = beat;  // cut as soon as it compiles
                 break;
@@ -1756,6 +1761,10 @@ void smartTick(double t) {
                 break;
             case MusicStructure::SongChange: smartPrepare(0, 0, nextBar, transitionSeconds(), false); break;
             case MusicStructure::SongEnd: smartPrepare(0, 2, 0, 0, true); break;
+            case MusicStructure::Fakeout:  // that was not the real drop: get another one ready for it
+                smart.afterFake = true;
+                if (S.fakeoutRecut) smartPrepare(1, 1, 0, 0, true);
+                break;
         }
     }
     if (!active) {
@@ -1777,7 +1786,7 @@ void smartTick(double t) {
     }
     double since = t - std::max(smart.lastSwitch, decks[onAirDeck()].lastSwitch);
     if (low) {
-        if (since > 2) smartPrepare(1, 1, 0, 0, true);  // have the drop preset ready
+        if (since > 2 && !(smart.afterFake && !S.fakeoutRecut)) smartPrepare(1, 1, 0, 0, true);  // have the drop preset ready
     } else if (sec != MusicStructure::Silence && since >= S.interval - 2) {
         smartPrepare(0, 0, structure.nextBoundary(beat + lead, phraseBars()), transitionSeconds(), false);
     }
@@ -3155,6 +3164,8 @@ void drawMixer() {
         ImGui::SetTooltip("Switches on phrase boundaries, cuts to an intense preset exactly on the drop,\n"
                           "goes calm with a long blend in breakdowns, and changes when a new song starts.");
     if (S.smartMix) {
+        ImGui::Checkbox("After a fakeout, switch again on the real drop", &S.fakeoutRecut);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Some songs drop for a bar or two, cut out, then drop for real.\nOn: the real drop gets its own fresh preset. Off: keep the one from the fake drop.");
         double hb = beatNow();
         ImGui::TextDisabled("Now: %s   bar %d/8, beat %d   energy %.2f   last: %s", MusicStructure::name(structure.section()),
                             structure.barInPhrase(hb) + 1, structure.beatInBar(hb) + 1, structure.energy(),
@@ -4334,11 +4345,12 @@ void buildSelftest() {
     double t = 2.5;
     auto at = [&](double dt, std::function<void()> f) { t += dt; testSteps.push_back({t, std::move(f)}); };
     at(0, [] { testNote("presets=" + std::to_string(lib.size()) + " A=" + curName(0) + " audio=" + audio.label() + " sources=" + std::to_string(sourceNames.size())); pendingShot = "01-start"; });
-    // smart auto-mix: synthetic 128 BPM track -> intro/groove 16 bars, breakdown 8 bars, drop 16 bars, silence
-    at(0, [] {
+    // smart auto-mix: synthetic 128 BPM tracks -> groove 16 bars, breakdown 8 bars, drop 16 bars, silence;
+    // the second one has a fakeout: one bar of drop, one bar without bass, then the real drop at beat 104
+    auto synth = [](std::function<bool(double)> kickOn, double beats) {
         MusicStructure ms;
         const double rate = 48000, bpm = 128, spb = 60 / bpm, t0 = 1.0;
-        const double total = t0 + 40 * 4 * spb + 3.0;
+        const double total = t0 + beats * spb + 3.0;
         std::vector<float> blk(480 * 2);
         std::mt19937 g(7);
         std::uniform_real_distribution<float> nz(-1, 1);
@@ -4347,10 +4359,9 @@ void buildSelftest() {
             for (int i = 0; i < 480; i++) {
                 double tt = (f0 + i) / rate, sb = (tt - t0) / spb;
                 float v = 0;
-                if (sb >= 0 && sb < 160) {
+                if (sb >= 0 && sb < beats) {
                     double ph = (sb - std::floor(sb)) * spb;
-                    bool kick = sb < 64 || sb >= 96;
-                    if (kick) v += 0.7f * (float)(std::sin(2 * M_PI * 55 * ph) * std::exp(-ph / 0.12));
+                    if (kickOn(sb)) v += 0.7f * (float)(std::sin(2 * M_PI * 55 * ph) * std::exp(-ph / 0.12));
                     v += 0.08f * (float)std::sin(2 * M_PI * 440 * tt);                       // pad
                     if (sb >= 80 && sb < 96) v += 0.02f * (float)(sb - 80) * nz(g) * 0.3f;  // build: rising noise
                     else v += 0.03f * nz(g) * (float)std::exp(-std::fmod(ph, spb / 2) / 0.03);  // hats
@@ -4365,7 +4376,29 @@ void buildSelftest() {
                 log += b;
             }
         }
-        testNote("structure: " + log);
+        return log;
+    };
+    at(0, [synth] {
+        testNote("structure: " + synth([](double b) { return b < 64 || b >= 96; }, 160));
+        testNote("structure fakeout: " + synth([](double b) { return b < 64 || (b >= 96 && b < 100) || b >= 104; }, 168));
+    });
+    at(0, [] {  // auto-pilot stays inside the filtered list, even with a stale pre-picked preset
+        query = "mashup";
+        rebuildView();
+        int outside = -1;
+        for (int i = 0; i < (int)lib.size() && outside < 0; i++)
+            if (std::find(view.begin(), view.end(), i) == view.end()) outside = i;
+        upcoming = outside;
+        int ok = 0;
+        for (int k = 0; k < 10; k++) {
+            go(0, 1, false, true);
+            int p = decks[0].pendingIdx;
+            if (p >= 0 && std::find(view.begin(), view.end(), p) != view.end()) ok++;
+            upcoming = outside;
+        }
+        testNote("auto stays in filter: " + std::to_string(ok) + "/10 (view " + std::to_string(view.size()) + ")");
+        query.clear();
+        rebuildView();
     });
     // decks + crossfader
     at(1.0, [] { pressKey(SDLK_TAB); pressKey(SDLK_r); testNote("focus=" + std::string(decks[focus].name) + " B=" + curName(1)); S.showMixer = true; });

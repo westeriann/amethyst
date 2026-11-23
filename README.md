@@ -22,7 +22,7 @@ The old browser-based prototype lives in [`browser-version/`](browser-version/) 
 * Two decks (A/B) with a crossfader and 7 mix modes: crossfade, add, screen, multiply, difference,
   lighten, luma key. `Tab` switches which deck you're driving; `\` auto-crossfades.
 * Auto-pilot (in order or shuffled, optional A/B auto-mixing), launch quantize to beat / bar / 4 bars.
-* **Smart auto-mix** follows the song: it detects song start, end and change, breakdowns, build-ups and drops, switches on 8-bar phrase boundaries, cuts to an intense preset exactly on the drop (prepared ahead of time), and goes calm with a long blend in breakdowns.
+* **Smart auto-mix** follows the song: it detects song start, end and change, breakdowns, build-ups and drops, switches on 8-bar phrase boundaries, cuts to an intense preset exactly on the drop (prepared ahead of time), and goes calm with a long blend in breakdowns. A fakeout detector spots drops that cut out after a bar or few and gives the real drop its own switch (optional, in the Mixer). Auto-pilot only picks from the presets your pool, folder and search filters show.
 * Beat detection tuned on real drum & bass, dubstep, house and UKG: locks onto the right tempo (e.g. 174 for DnB) and holds it instead of jumping between half, double or 2/3 speed.
 * Presets compile on background threads, so clicking a preset or using the phone remote never stalls the picture.
 * Tempo: automatic BPM + phase detection from the audio, tap tempo (`T`), or **Ableton Link**.

@@ -9,13 +9,23 @@ constexpr double kRate = 48000.0;
 constexpr float kQuiet = 0.003f;  // about -50 dBFS
 }  // namespace
 
+static double posMod(double a, double m) {
+    double r = std::fmod(a, m);
+    return r < 0 ? r + m : r;
+}
+
 const char* MusicStructure::name(Section s) {
     static const char* n[] = {"Silence", "Intro", "Groove", "Breakdown", "Build-up", "Drop"};
     return n[s];
 }
 const char* MusicStructure::name(Event e) {
-    static const char* n[] = {"Song start", "Song end", "New song", "Breakdown", "Drop"};
+    static const char* n[] = {"Song start", "Song end", "New song", "Breakdown", "Drop", "Fakeout"};
     return n[e];
+}
+
+float MusicStructure::peakOf(long long b) const {
+    int k = (int)posMod((double)b, 32);
+    return ringIdx_[k] == b ? ringPeak_[k] : -1.f;
 }
 
 void MusicStructure::enter(Section s, double beat) {
@@ -29,10 +39,6 @@ std::vector<MusicStructure::Ev> MusicStructure::take() {
     return v;
 }
 
-static double posMod(double a, double m) {
-    double r = std::fmod(a, m);
-    return r < 0 ? r + m : r;
-}
 int MusicStructure::beatInBar(double beat) const { return (int)posMod(std::floor(beat - anchor_ + 1e-6), 4); }
 int MusicStructure::barInPhrase(double beat) const { return (int)posMod(std::floor((beat - anchor_) / 4 + 1e-6), 8); }
 double MusicStructure::nextBoundary(double beat, int bars) const {
@@ -83,6 +89,7 @@ void MusicStructure::hop(float bass, float lvl, double t, double beat, double bp
     if (sec_ == Silence) {
         if (soundFor_ >= 0.2) {
             emit(SongStart, beat, t);
+            fakeUsed_ = false;
             enter(Intro, beat);
             bassRef_ = bassM_;
             stableBpm_ = 0;
@@ -131,11 +138,36 @@ void MusicStructure::hop(float bass, float lvl, double t, double beat, double bp
         }
     }
 
+    // fakeout: a "drop" whose bass disappears again for most of a bar within its first three bars
+    if (sec_ == Drop && ib != lastIb_ && !fakeUsed_) {
+        long long D = std::llround(secBeat_), done = ib - 1;  // last completed beat
+        float pk = peakOf(done);
+        if (done <= D + 1) {
+            dropLevel_ = std::max(dropLevel_, pk);
+        } else if (done <= D + 18 && pk >= 0) {
+            if (pk < dropLevel_ * 0.3f) {
+                if (lowRun_++ == 0) lowRunStart_ = done;
+            } else {
+                lowRun_ = 0;
+            }
+            if (lowRun_ >= 3 && lowRunStart_ <= D + 16) {  // fake drops of up to four bars
+                emit(Fakeout, (double)lowRunStart_, t);
+                fakeUsed_ = true;
+                enter(Build, (double)lowRunStart_);
+                winStart_ = lowRunStart_;  // the real drop is measured against the quiet part only
+                lowRun_ = 0;
+            }
+        }
+    }
+    lastIb_ = ib;
+
     // drop: the bass comes back far above everything in the previous two bars
     if (beat - songBeat_ >= 16 && (sec_ != Drop || beat - secBeat_ >= 32)) {
         float prev = 0;
         bool full = true;
-        for (long long b = ib - 8; b < ib; b++) {  // two bars without real bass before it
+        long long from = std::max(ib - 8, winStart_);
+        if (ib - from < 2) full = false;
+        for (long long b = from; full && b < ib; b++) {  // up to two bars without real bass before it
             int k = (int)posMod((double)b, 32);
             if (ringIdx_[k] != b) { full = false; break; }
             prev = std::max(prev, ringPeak_[k]);
@@ -147,6 +179,9 @@ void MusicStructure::hop(float bass, float lvl, double t, double beat, double bp
             anchored_ = true;
             enter(Drop, at);
             lowSince_ = -1;
+            dropLevel_ = bassF_;
+            lowRun_ = 0;
+            winStart_ = -(1LL << 40);
             return;
         }
     }
@@ -165,6 +200,7 @@ void MusicStructure::hop(float bass, float lvl, double t, double beat, double bp
                 }
                 double at = (double)st;
                 emit(BreakdownStart, at, t);
+                fakeUsed_ = false;
                 if (!anchored_) anchor_ = at;
                 enter(Breakdown, at);
                 lowLvlMin_ = lvlM_;
@@ -173,10 +209,10 @@ void MusicStructure::hop(float bass, float lvl, double t, double beat, double bp
             lowSince_ = -1;
         }
         if (sec_ == Intro && beat - secBeat_ >= 16 && bassRef_ > 0.004f && bassM_ > bassRef_ * 0.6f) enter(Groove, beat);
-        if (sec_ == Drop && beat - secBeat_ >= 64) enter(Groove, beat);
+        if (sec_ == Drop && beat - secBeat_ >= 64) enter(Groove, beat), fakeUsed_ = false;
     } else {
         lowLvlMin_ = std::min(lowLvlMin_, lvlM_);
         if (sec_ == Breakdown && beat - secBeat_ >= 8 && lvlM_ > lowLvlMin_ * 1.4f) enter(Build, beat);
-        if (bassM_ > bassRef_ * 0.6f) enter(Groove, beat);  // bass faded back in without a clear drop
+        if (bassM_ > bassRef_ * 0.6f && beat - secBeat_ >= 8) enter(Groove, beat);  // bass faded back in without a clear drop
     }
 }

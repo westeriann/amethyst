@@ -7,7 +7,7 @@
 class MusicStructure {
 public:
     enum Section { Silence, Intro, Groove, Breakdown, Build, Drop };
-    enum Event { SongStart, SongEnd, SongChange, BreakdownStart, DropHit };
+    enum Event { SongStart, SongEnd, SongChange, BreakdownStart, DropHit, Fakeout };
     struct Ev {
         Event type;
         double beat, time;
@@ -41,6 +41,12 @@ private:
     float ringPeak_[32] = {};  // per-beat bass peaks
     long long ringIdx_[32] = {};
     double candBpm_ = 0, candFor_ = 0;
+    // fakeout tracking
+    long long lastIb_ = 0, lowRunStart_ = 0, winStart_ = -(1LL << 40);
+    int lowRun_ = 0;
+    float dropLevel_ = 0;
+    bool fakeUsed_ = false;  // one fakeout per drop: stop-start bass after it is the drop's rhythm
+    float peakOf(long long b) const;
     // hop accumulator
     double accB_ = 0, accA_ = 0;
     int accN_ = 0;
