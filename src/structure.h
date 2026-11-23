@@ -27,9 +27,12 @@ public:
     double nextBoundary(double beat, int bars) const;  // next beat that starts a block of `bars` bars
     double sectionBeats(double beat) const { return beat - secBeat_; }
     float energy() const;  // bass relative to the song's full level, 0..~1.5
+    // tests: hold a section regardless of the audio (pin = false releases it)
+    void debugPin(Section s, double beat, bool pin = true) { enter(s, beat); pinned_ = pin; }
 
 private:
     Section sec_ = Silence;
+    bool pinned_ = false;
     double secBeat_ = 0, anchor_ = 0;
     bool anchored_ = false;
     std::vector<Ev> out_;

@@ -38,6 +38,7 @@ public:
     struct Analysis {
         std::string path;
         float hue = 0, sat = 0, bright = 0, motion = 0;  // hue 0..1, others 0..1-ish
+        float punch = 0;  // how strongly it reacts to kicks, 0..1
         bool failed = false;
     };
     void queueAnalysis(std::vector<std::string> paths);

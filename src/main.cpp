@@ -69,7 +69,8 @@ const char* kOutputSources[] = {"Final output", "Deck A", "Deck B", "Mix (before
 struct Settings {
     float blend = 2;
     int interval = 20;
-    bool autoOn = false, shuffle = true, autoDecks = false, smartMix = true, fakeoutRecut = true;
+    bool autoOn = false, shuffle = true, autoDecks = false, smartMix = true, fakeoutRecut = true, autoFx = true, autoFxFlash = true;
+    float autoFxAmount = 0.7f;   // how hard Auto FX pushes the effects
     int quantize = 2;            // auto-pilot launch grid
     bool quantizeManual = false; // also quantize manual launches
     float gain = 1, speed = 1;
@@ -131,7 +132,7 @@ struct Field { const char* key; char type; void* p; };
 std::vector<Field> fields() {
     return {
         {"blend", 'f', &S.blend}, {"interval", 'i', &S.interval}, {"auto", 'b', &S.autoOn}, {"shuffle", 'b', &S.shuffle},
-        {"auto_decks", 'b', &S.autoDecks}, {"smart_mix", 'b', &S.smartMix}, {"fakeout_recut", 'b', &S.fakeoutRecut}, {"quantize", 'i', &S.quantize}, {"quantize_manual", 'b', &S.quantizeManual},
+        {"auto_decks", 'b', &S.autoDecks}, {"smart_mix", 'b', &S.smartMix}, {"fakeout_recut", 'b', &S.fakeoutRecut}, {"auto_fx", 'b', &S.autoFx}, {"auto_fx_flash", 'b', &S.autoFxFlash}, {"auto_fx_amount", 'f', &S.autoFxAmount}, {"quantize", 'i', &S.quantize}, {"quantize_manual", 'b', &S.quantizeManual},
         {"gain", 'f', &S.gain}, {"speed", 'f', &S.speed}, {"quality", 'i', &S.quality}, {"xfade", 'f', &S.xfade}, {"mix_mode", 'i', &S.mixMode},
         {"show_menu", 'b', &S.showMenu}, {"show_browser", 'b', &S.showBrowser}, {"show_hud", 'b', &S.showHud}, {"show_cues", 'b', &S.showCues},
         {"show_toasts", 'b', &S.showToasts}, {"show_status", 'b', &S.showStatus}, {"show_mixer", 'b', &S.showMixer}, {"show_fx", 'b', &S.showFx},
@@ -1578,9 +1579,10 @@ void applyTemplate(int tpl, const std::string& device) {
 }
 
 // ---- smart library: analysis results, colour/energy pools, similarity
-struct Look { float hue = 0, sat = 0, bright = 0, motion = 0; };
+struct Look { float hue = 0, sat = 0, bright = 0, motion = 0, punch = -1; };  // punch -1 = not measured yet
+void updateEnergyCuts();
 std::unordered_map<std::string, Look> looks;
-bool looksDirty = false;
+bool looksDirty = false, energyDirty = true;
 double lastLookSave = 0;
 const char* kColorNames[] = {"Red", "Orange", "Yellow", "Green", "Cyan", "Blue", "Purple", "Pink", "Mono"};
 const char* colorOf(const Look& l) {
@@ -1603,7 +1605,7 @@ float lookDistance(const Look& a, const Look& b) {
 }
 void saveLooks() {
     std::ofstream f(fs::u8path(gAnalysisPath), std::ios::trunc);
-    for (auto& [p, l] : looks) f << p << "|" << l.hue << "|" << l.sat << "|" << l.bright << "|" << l.motion << "\n";
+    for (auto& [p, l] : looks) f << p << "|" << l.hue << "|" << l.sat << "|" << l.bright << "|" << l.motion << "|" << l.punch << "\n";
     looksDirty = false;
 }
 void loadLooks() {
@@ -1611,14 +1613,19 @@ void loadLooks() {
     std::string line;
     while (std::getline(f, line)) {
         auto p = splitBar(line);
-        if (p.size() != 5) continue;
-        looks[p[0]] = {(float)std::atof(p[1].c_str()), (float)std::atof(p[2].c_str()), (float)std::atof(p[3].c_str()), (float)std::atof(p[4].c_str())};
+        if (p.size() != 5 && p.size() != 6) continue;
+        looks[p[0]] = {(float)std::atof(p[1].c_str()), (float)std::atof(p[2].c_str()), (float)std::atof(p[3].c_str()), (float)std::atof(p[4].c_str()),
+                       p.size() == 6 ? (float)std::atof(p[5].c_str()) : -1.f};
     }
 }
 void queueAnalysis() {
     std::vector<std::string> todo;
     for (auto& p : lib)
         if (!p.broken && !looks.count(p.path)) todo.push_back(p.path);
+    for (auto& p : lib) {  // then measure bass punch for presets analysed by older versions
+        auto it = looks.find(p.path);
+        if (!p.broken && it != looks.end() && it->second.punch < 0) todo.push_back(p.path);
+    }
     thumbs.analysisEnabled = S.analysisOn;
     thumbs.queueAnalysis(std::move(todo));
 }
@@ -1629,10 +1636,36 @@ void intakeAnalysis(double t) {
             if (it != byPath.end()) markBroken(it->second, "failed during analysis");
             continue;
         }
-        looks[a.path] = {a.hue, a.sat, a.bright, a.motion};
+        looks[a.path] = {a.hue, a.sat, a.bright, a.motion, a.punch};
         looksDirty = true;
+        energyDirty = true;
     }
     if (looksDirty && t - lastLookSave > 20) { lastLookSave = t; saveLooks(); }
+    static double lastCuts = -100;
+    if (energyDirty && t - lastCuts > 10) { lastCuts = t; updateEnergyCuts(); }
+}
+// Energy classes, relative to this library: intense = hits hard on kicks (top ~30% by punch, not static),
+// calm = little motion and little punch. Presets without a punch score fall back to motion only.
+struct EnergyCuts { float punchHi = 2, punchMid = 2, motionLo = 0.12f; bool punchKnown = false; } ecuts;
+void updateEnergyCuts() {
+    std::vector<float> p, m;
+    for (auto& [k, l] : looks) {
+        m.push_back(l.motion);
+        if (l.punch >= 0) p.push_back(l.punch);
+    }
+    auto pct = [](std::vector<float>& v, float q) { size_t i = std::min(v.size() - 1, (size_t)(q * v.size())); std::nth_element(v.begin(), v.begin() + i, v.end()); return v[i]; };
+    if (m.size() >= 20) ecuts.motionLo = pct(m, 0.3f);
+    ecuts.punchKnown = p.size() >= 20;
+    if (ecuts.punchKnown) ecuts.punchHi = pct(p, 0.7f), ecuts.punchMid = pct(p, 0.5f);
+    energyDirty = false;
+}
+int energyClass(const Look& l) {
+    if (l.punch >= 0 && ecuts.punchKnown) {
+        if (l.punch >= ecuts.punchHi && l.motion > ecuts.motionLo) return 1;
+        if (l.motion <= ecuts.motionLo && l.punch < ecuts.punchMid) return -1;
+        return 0;
+    }
+    return l.motion > 0.35f ? 1 : l.motion < 0.12f ? -1 : 0;
 }
 // pools understood by inPool(): "color:<Name>", "energy:calm|intense", "light:dark|bright", "similar:<path>"
 bool smartPoolMatch(int i) {
@@ -1640,13 +1673,172 @@ bool smartPoolMatch(int i) {
     if (it == looks.end()) return false;
     const Look& l = it->second;
     if (S.pool.rfind("color:", 0) == 0) return S.pool.substr(6) == colorOf(l);
-    if (S.pool == "energy:calm") return l.motion < 0.12f;
-    if (S.pool == "energy:intense") return l.motion > 0.35f;
+    if (S.pool == "energy:calm") return energyClass(l) < 0;
+    if (S.pool == "energy:intense") return energyClass(l) > 0;
     if (S.pool == "light:dark") return l.bright < 0.18f;
     if (S.pool == "light:bright") return l.bright > 0.42f;
     return true;
 }
 
+
+// ---- Auto FX: while auto-pilot runs, every effect follows the song. Drops get a flash, a zoom punch,
+// an RGB burst and an 8th-note strobe bar plus a strong new look; build-ups ramp zoom, swirl, RGB split,
+// brightness and an accelerating strobe; fakeout gaps go dark and colourless; breakdowns get soft trails;
+// grooves change look every 8-bar phrase; songs fade out and back in. Transition styles fit the moment.
+struct AutoFx {
+    int look = 0;
+    double lookBeat = 0, dropBeat = -1e9, fakeBeat = -1e9, startT = -1e9, endT = -1e9;
+    float rot = 0, white = 0, black = 0;
+    int transition = -1;  // style for preset switches (-1 = the user's own setting)
+    long long lastPhrase = -(1LL << 40);
+} afx;
+bool autoFxOn() { return S.autoOn && S.autoFx; }
+void autoFlash(float amt) { if (S.autoFxFlash) flashAmt = std::max(flashAmt, amt); }
+void autoWhite(float amt) { if (S.autoFxFlash) afx.white = std::max(afx.white, amt); }
+
+const int kDropLooks[] = {0, 1, 2, 3, 6, 7}, kCalmLooks[] = {2, 4, 5}, kGrooveLooks[] = {0, 1, 2, 4, 5, 6};
+const char* kLookNames[] = {"Kaleidoscope spin", "Quad mirror + RGB", "Tunnel trails", "Beat pixels", "Colour cycle", "Swirl", "Kaleido trails", "Mirror flips"};
+void pickLook(const int* set, int n) {
+    int l = afx.look;
+    for (int k = 0; k < 8 && (l == afx.look || k == 0); k++) l = set[rng() % n];
+    afx.look = l;
+    afx.lookBeat = beatNow();
+}
+int randomTransition() { return 1 + (int)(rng() % (TransitionCount - 1)); }
+
+void applyLook(int id, FxParams& f, float a, double beat, double dt) {
+    float env = (float)std::exp(-(beat - std::floor(beat)) * 6);  // pulse on every beat
+    switch (id) {
+        case 0:
+            f.kaleido = true;
+            f.kaleidoSegments = 6 + 2 * ((int)afx.lookBeat % 3);
+            afx.rot += (float)(dt * 0.5 * a);
+            break;
+        case 1:
+            f.mirror = true, f.mirrorMode = 3;
+            f.rgbSplitAmount = std::max(f.rgbSplit ? f.rgbSplitAmount : 0.f, 0.004f + 0.02f * a * env);
+            f.rgbSplit = true;
+            break;
+        case 2:
+            f.feedbackAmount = std::max(f.feedback ? f.feedbackAmount : 0.f, 0.7f + 0.2f * a);
+            f.feedback = true, f.feedbackZoom = 1.02f + 0.02f * a, f.feedbackRotate = 0.01f * a;
+            break;
+        case 3:
+            if (env > 0.25f) {
+                f.pixelSize = std::max(f.pixelate ? f.pixelSize : 0.f, 3 + 28 * a * env);
+                f.pixelate = true;
+            }
+            break;
+        case 4:
+            f.hue += (float)std::fmod(beat * 0.02, 1.0);
+            f.hue -= std::floor(f.hue);
+            f.saturation *= 1 + 0.4f * a, f.contrast *= 1 + 0.25f * a;
+            break;
+        case 5: f.swirl += (float)std::sin(beat * 3.14159 / 8) * 1.5f * a; break;
+        case 6:
+            f.kaleido = true, f.kaleidoSegments = 4;
+            f.feedbackAmount = std::max(f.feedback ? f.feedbackAmount : 0.f, 0.6f + 0.25f * a);
+            f.feedback = true, f.feedbackZoom = 0.98f;
+            break;
+        case 7:
+            f.mirror = true, f.mirrorMode = 1;
+            if (S.autoFxFlash && a > 0.4f && std::fmod(beat, 4.0) < 0.15) f.invert = !f.invert;
+            break;
+    }
+}
+
+void autoFxEvent(MusicStructure::Event e) {
+    if (!autoFxOn()) return;
+    float a = S.autoFxAmount;
+    switch (e) {
+        case MusicStructure::DropHit:
+            afx.dropBeat = beatNow();
+            autoFlash(std::min(1.f, 0.4f + a));
+            pickLook(kDropLooks, 6);
+            afx.lastPhrase = (long long)std::floor(structure.nextBoundary(afx.dropBeat, 8));
+            afx.transition = rng() % 2 ? TransZoom : TransGlitch;
+            break;
+        case MusicStructure::Fakeout: afx.fakeBeat = beatNow(); break;
+        case MusicStructure::BreakdownStart:
+            pickLook(kCalmLooks, 3);
+            afx.transition = rng() % 2 ? TransDissolve : TransLuma;
+            break;
+        case MusicStructure::SongStart: afx.startT = now(), afx.endT = -1e9; break;
+        case MusicStructure::SongChange:
+            pickLook(kGrooveLooks, 6);
+            afx.transition = randomTransition();
+            break;
+        case MusicStructure::SongEnd: afx.endT = now(); break;
+    }
+}
+
+void autoFxApply(double t, double dt) {
+    afx.white = afx.black = 0;
+    if (!autoFxOn()) return;
+    FxParams& f = modOut.fx;
+    float a = S.autoFxAmount;
+    double b = beatNow(), fr = b - std::floor(b);
+    float beatEnv = (float)std::exp(-fr * 6), barEnv = (float)std::exp(-(structure.beatInBar(b) + fr) * 3);
+    auto sec = structure.section();
+    long long phrase = (long long)std::floor(structure.nextBoundary(b, 8));
+    bool newPhrase = phrase != afx.lastPhrase;
+    switch (sec) {
+        case MusicStructure::Drop: {
+            if (newPhrase) pickLook(kDropLooks, 6), afx.transition = randomTransition();
+            applyLook(afx.look, f, a, b, dt);
+            f.zoom *= 1 + 0.06f * a * beatEnv;
+            double k = b - afx.dropBeat;
+            if (k >= 0 && k < 4) {  // the first bar of the drop: zoom punch, RGB burst, 8th-note strobe
+                f.zoom *= 1 + 0.3f * a * (float)std::exp(-k * 2);
+                f.rgbSplitAmount = std::max(f.rgbSplit ? f.rgbSplitAmount : 0.f, 0.03f * a * (float)std::exp(-k * 1.5));
+                f.rgbSplit = true;
+                if (std::fmod(b * 2, 1.0) < 0.2) autoWhite(0.7f * a);
+            }
+            break;
+        }
+        case MusicStructure::Groove:
+            if (newPhrase) {
+                pickLook(kGrooveLooks, 6);
+                autoFlash(0.3f * a);
+                afx.transition = randomTransition();
+            }
+            applyLook(afx.look, f, a * 0.6f, b, dt);
+            f.zoom *= 1 + 0.04f * a * barEnv;
+            break;
+        case MusicStructure::Intro: applyLook(5, f, a * 0.3f, b, dt); break;
+        case MusicStructure::Breakdown:
+            applyLook(afx.look, f, a * 0.5f, b, dt);
+            f.saturation *= 1 - 0.25f * a;
+            f.feedbackAmount = std::max(f.feedback ? f.feedbackAmount : 0.f, 0.8f * a);
+            f.feedback = true;
+            break;
+        case MusicStructure::Build: {
+            if (afx.fakeBeat > afx.dropBeat && b - afx.fakeBeat < 16) {  // fakeout gap: hold your breath
+                f.saturation = 0;
+                f.brightness -= 0.3f * a;
+                f.feedback = true, f.feedbackAmount = 0.95f;
+                break;
+            }
+            float p = (float)std::clamp(structure.sectionBeats(b) / 32.0, 0.0, 1.0);  // full tension after 8 bars
+            f.zoom *= 1 + 0.25f * a * p;
+            f.swirl += 2.f * a * p * (float)std::sin(b * 3.14159 / 2);
+            f.rgbSplitAmount = std::max(f.rgbSplit ? f.rgbSplitAmount : 0.f, 0.025f * a * p);
+            f.rgbSplit = true;
+            f.brightness += 0.12f * a * p;
+            if (p > 0.3f) {  // strobe speeds up: quarters, eighths, sixteenths
+                double rate = p < 0.6f ? 1 : p < 0.85f ? 2 : 4;
+                if (std::fmod(b * rate, 1.0) < 0.18) autoWhite((0.25f + 0.5f * p) * a);
+            }
+            break;
+        }
+        case MusicStructure::Silence:
+            if (t - afx.endT < 120) afx.black = (float)std::min(1.0, (t - afx.endT) / 2.0) * 0.85f * a;
+            break;
+    }
+    afx.lastPhrase = phrase;
+    if (t - afx.startT < 2) afx.black = std::max(afx.black, (float)(1 - (t - afx.startT) / 2) * 0.85f * a);  // fade in
+    modOut.rotOffset += afx.rot;
+}
 
 // ---- smart auto-mix: follows the song structure, prepares the next preset ahead of time and
 // switches exactly on the bar / drop.
@@ -1672,8 +1864,7 @@ int smartPick(int energy) {
         if (lib[i].broken || i == decks[0].cur || i == decks[1].cur) continue;
         auto it = looks.find(lib[i].path);
         if (it == looks.end()) continue;
-        float m = it->second.motion;
-        if (energy > 0 ? m > 0.35f : m < 0.12f) c.push_back(i);
+        if (energyClass(it->second) == energy) c.push_back(i);
     }
     if (c.empty()) return pickRandom(decks[on].cur);
     return c[std::uniform_int_distribution<size_t>(0, c.size() - 1)(rng)];
@@ -1743,6 +1934,7 @@ void smartTick(double t) {
     auto events = structure.take();
     bool active = S.autoOn && S.smartMix && !locked;
     for (auto& e : events) {
+        autoFxEvent(e.type);
         smart.lastEvent = MusicStructure::name(e.type);
         smart.lastEventAt = t;
         if (!active) continue;
@@ -1936,6 +2128,7 @@ void renderFrame(double t, double dt) {
         renderH = h;
     }
     applyModulation(beatNow());
+    autoFxApply(t, dt);
     // Deck B is only rendered when it can be seen.
     bool needB = modOut.xfade > 0.001f || S.mixMode != MixCrossfade || S.showMixer || xanim.active;
     for (auto& o : outputs) needB |= o.source == 2;
@@ -1952,7 +2145,8 @@ void renderFrame(double t, double dt) {
         if (dk.blending) {
             float k = (float)std::clamp((t - dk.blendStart) / std::max(0.01, dk.blendDur), 0.0, 1.0);
             dk.rt.ensure(w, h);
-            gfx.mix(dk.rt, dk.spare().texture(), cur, k * k * (3 - 2 * k), MixCrossfade);
+            if (autoFxOn() && afx.transition > 0) gfx.transition(dk.rt, dk.spare().texture(), cur, k * k * (3 - 2 * k), afx.transition, (float)t);
+            else gfx.mix(dk.rt, dk.spare().texture(), cur, k * k * (3 - 2 * k), MixCrossfade);
             dk.outTex = dk.rt.tex;
             if (k >= 1) dk.blending = false;
         } else {
@@ -1962,10 +2156,11 @@ void renderFrame(double t, double dt) {
     mixRT.ensure(w, h);
     for (auto& r : fxRT) r.ensure(w, h);
     finalRT.ensure(w, h);
-    if (xanim.active && S.transition > 0 && needB) {
+    int trans = autoFxOn() && afx.transition >= 0 ? afx.transition : S.transition;
+    if (xanim.active && trans > 0 && needB) {
         bool toB = xanim.to > xanim.from;
         float p = toB ? S.xfade : 1 - S.xfade;
-        gfx.transition(mixRT, decks[toB ? 0 : 1].outTex, decks[toB ? 1 : 0].outTex, std::clamp(p, 0.f, 1.f), S.transition, (float)t);
+        gfx.transition(mixRT, decks[toB ? 0 : 1].outTex, decks[toB ? 1 : 0].outTex, std::clamp(p, 0.f, 1.f), trans, (float)t);
     } else {
         gfx.mix(mixRT, decks[0].outTex, needB ? decks[1].outTex : decks[0].outTex, needB ? modOut.xfade : 0.f, S.mixMode);
     }
@@ -1980,7 +2175,7 @@ void renderFrame(double t, double dt) {
         double ph = S.fx.strobeOnBeat ? std::fmod(beatNow() * std::max(1.f, S.fx.strobeRate / 4.f), 1.0) : std::fmod(t * S.fx.strobeRate, 1.0);
         strobe = ph < 0.25 ? 1.f : 0.f;
     }
-    gfx.finalize(finalRT, fxRT[fxIdx].tex, blackAmt, std::max(flashAmt, strobe));
+    gfx.finalize(finalRT, fxRT[fxIdx].tex, std::max(blackAmt, afx.black), std::max({flashAmt, strobe, afx.white}));
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     if (S.spout) {
         if (!spoutNamed) { spout.SetSenderName("Amethyst"); spoutNamed = true; }
@@ -2041,6 +2236,9 @@ void registerActions() {
     trig("mix_mode", "Mix mode", "Mixer", [] { S.mixMode = (S.mixMode + 1) % MixModeCount; toast(false, "Mix: %s", mixModeName(S.mixMode)); });
     toggle("auto_decks", "Auto-mix decks", "Mixer", &S.autoDecks);
     toggle("smart_mix", "Smart auto-mix (follow the song)", "Auto-pilot", &S.smartMix);
+    toggle("auto_fx", "Auto FX", "Auto-pilot", &S.autoFx);
+    toggle("auto_fx_flash", "Auto FX flashes", "Auto-pilot", &S.autoFxFlash);
+    cont("auto_fx_amount", "Auto FX strength", "Auto-pilot", [](float v) { S.autoFxAmount = v; }, [] { return S.autoFxAmount; });
 
     toggle("auto", "Auto-pilot", "Auto-pilot", &S.autoOn, [] { decks[0].lastSwitch = decks[1].lastSwitch = now(); });
     toggle("shuffle", "Shuffle", "Auto-pilot", &S.shuffle);
@@ -3085,8 +3283,8 @@ void drawHud(float y, float h) {
     double left = std::max(0.0, S.interval - since);
     double hb = beatNow();
     if (S.autoOn && S.smartMix)
-        snprintf(b, sizeof b, "AUTO smart  %s  bar %d/8%s%s", MusicStructure::name(structure.section()), structure.barInPhrase(hb) + 1,
-                 S.autoDecks ? ", A/B mix" : "", keyHint("auto").c_str());
+        snprintf(b, sizeof b, "AUTO smart  %s  bar %d/8%s%s%s", MusicStructure::name(structure.section()), structure.barInPhrase(hb) + 1,
+                 S.autoFx ? " +FX" : "", S.autoDecks ? ", A/B mix" : "", keyHint("auto").c_str());
     else if (S.autoOn) snprintf(b, sizeof b, "AUTO %s  %s%s%s", locked ? "--" : (std::to_string((int)std::ceil(left)) + "s").c_str(), S.shuffle ? "shuffle" : "in order", S.autoDecks ? ", A/B mix" : "", keyHint("auto").c_str());
     else snprintf(b, sizeof b, "AUTO off%s", keyHint("auto").c_str());
     pill(b, kAccent2, S.autoOn, "Auto-pilot (A). Interval , .  Shuffle S.  Quantize K", [] { actions.invoke("auto", true); });
@@ -3165,6 +3363,19 @@ void drawMixer() {
                           "goes calm with a long blend in breakdowns, and changes when a new song starts.");
     if (S.smartMix) {
         ImGui::Checkbox("After a fakeout, switch again on the real drop", &S.fakeoutRecut);
+        ImGui::Checkbox("Auto FX: effects follow the song", &S.autoFx);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("While auto-pilot runs: flash, zoom punch and strobe on drops, risers in build-ups,\n"
+                              "dark tension in fakeout gaps, soft trails in breakdowns, a new effect look every phrase,\n"
+                              "fades between songs and matching transition styles. Adds on top of your own FX.");
+        if (S.autoFx) {
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(140);
+            ImGui::SliderFloat("strength##afx", &S.autoFxAmount, 0.f, 1.f, "%.2f");
+            ImGui::Checkbox("Auto FX flashes & strobes", &S.autoFxFlash);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Off: Auto FX never flashes white, strobes or flips colours.\nEverything else (zoom, trails, mirrors...) still follows the song.");
+            ImGui::TextDisabled("Auto FX look: %s", kLookNames[afx.look]);
+        }
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Some songs drop for a bar or two, cut out, then drop for real.\nOn: the real drop gets its own fresh preset. Off: keep the one from the fake drop.");
         double hb = beatNow();
         ImGui::TextDisabled("Now: %s   bar %d/8, beat %d   energy %.2f   last: %s", MusicStructure::name(structure.section()),
@@ -4594,6 +4805,39 @@ void buildSelftest() {
         setPool("color:Blue");
     });
     at(1.0, [] { pendingShot = "20-colour-pool"; setPool("all"); });
+    // Auto FX: pin the song section and look at what the effects do
+    at(0.5, [] {
+        S.autoOn = true, S.autoFx = true, S.autoFxAmount = 0.8f, S.showMixer = false;
+        structure.debugPin(MusicStructure::Build, beatNow() - 28);
+    });
+    at(1.2, [] {
+        testNote("autofx build: zoom=" + std::to_string(modOut.fx.zoom) + " swirl=" + std::to_string(modOut.fx.swirl) +
+                 " rgb=" + std::to_string(modOut.fx.rgbSplitAmount));
+        pendingShot = "21-autofx-build";
+    });
+    at(0.5, [] {
+        structure.debugPin(MusicStructure::Drop, beatNow());
+        autoFxEvent(MusicStructure::DropHit);
+    });
+    at(0.1, [] {
+        testNote("autofx drop: look=" + std::string(kLookNames[afx.look]) + " zoom=" + std::to_string(modOut.fx.zoom) +
+                 " flash=" + std::to_string(flashAmt) + " transition=" + std::to_string(afx.transition));
+        pendingShot = "22-autofx-drop";
+    });
+    at(1.5, [] { pendingShot = "23-autofx-drop-later"; });
+    at(0.5, [] {
+        structure.debugPin(MusicStructure::Silence, beatNow(), false);
+        S.autoOn = false;
+        int n = 0;
+        std::vector<float> p;
+        for (auto& [k, l] : looks)
+            if (l.punch >= 0) p.push_back(l.punch);
+        std::sort(p.begin(), p.end());
+        auto q = [&](float f) { return p.empty() ? -1.f : p[std::min(p.size() - 1, (size_t)(f * p.size()))]; };
+        for (auto& [k, l] : looks) n += energyClass(l) > 0;
+        testNote("punch measured=" + std::to_string(p.size()) + " p10=" + std::to_string(q(0.1f)) + " p50=" + std::to_string(q(0.5f)) +
+                 " p90=" + std::to_string(q(0.9f)) + " intense=" + std::to_string(n));
+    });
     at(1.0, [] { running = false; });
 }
 

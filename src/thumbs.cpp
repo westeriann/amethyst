@@ -80,7 +80,7 @@ int ThumbRenderer::analysisPending() {
 
 // Render a preset off-screen for ~1.5 s of synthetic music and measure it.
 bool ThumbRenderer::analyzeOne(const std::string& path, Analysis& out, const std::vector<std::string>& texPaths) {
-    const int W = 64, H = 36, frames = 48;
+    const int W = 64, H = 36, frames = 72;  // 0.8 s quiet pad, then 120 BPM kicks
     if (!apm_) {
         apm_ = projectm_create();
         if (!apm_) return false;
@@ -107,12 +107,14 @@ bool ThumbRenderer::analyzeOne(const std::string& path, Analysis& out, const std
     out.path = path;
     if (failed) { out.failed = true; return true; }
     std::vector<float> pcm(2 * 735);
-    std::vector<unsigned char> a((size_t)W * H * 4), b((size_t)W * H * 4);
+    std::vector<unsigned char> a((size_t)W * H * 4), b((size_t)W * H * 4), px((size_t)W * H * 4);
+    std::vector<float> lum((size_t)W * H, 0.f), D(frames, 0.f);
     static double t0 = 0;
     for (int f = 0; f < frames; f++) {
         for (int s = 0; s < 735; s++) {  // 120 BPM kick + hats + pad
-            double t = (f * 735 + s) / 44100.0, ph = std::fmod(t, 0.5);
-            float v = (float)(0.8 * std::sin(2 * 3.14159 * (55 + 90 * std::exp(-ph * 25)) * ph) * std::exp(-ph * 7) +
+            double t = (f * 735 + s) / 44100.0, ph = std::fmod(t - 0.8, 0.5);
+            float kick = t < 0.8 ? 0.f : 1.f;  // first 24 frames: no kick, so the preset settles
+            float v = (float)(kick * 0.8 * std::sin(2 * 3.14159 * (55 + 90 * std::exp(-ph * 25)) * ph) * std::exp(-ph * 7) +
                               0.25 * std::sin(2 * 3.14159 * 220 * t) * 0.5 + ((rand() % 2000) / 1000.0 - 1) * 0.08 * std::exp(-std::fmod(t, 0.25) * 30));
             pcm[2 * s] = pcm[2 * s + 1] = v;
         }
@@ -123,10 +125,17 @@ bool ThumbRenderer::analyzeOne(const std::string& path, Analysis& out, const std
         glViewport(0, 0, W, H);
         projectm_opengl_render_frame_fbo(pm, afbo_);
         if (failed) { out.failed = true; return true; }
-        if (f == frames - 9 || f == frames - 1) {
-            glPixelStorei(GL_PACK_ALIGNMENT, 1);
-            glReadPixels(0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, f == frames - 1 ? b.data() : a.data());
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glReadPixels(0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+        double d = 0;
+        for (size_t i = 0, j = 0; i < px.size(); i += 4, j++) {
+            float l = (px[i] + px[i + 1] + px[i + 2]) / 765.f;
+            d += std::fabs(l - lum[j]);
+            lum[j] = l;
         }
+        D[f] = f > 0 ? (float)(d / (W * H)) : 0.f;
+        if (f == frames - 9) a = px;
+        if (f == frames - 1) b = px;
     }
     double hx = 0, hy = 0, satSum = 0, valSum = 0, motion = 0;
     for (size_t i = 0; i < b.size(); i += 4) {
@@ -155,6 +164,20 @@ bool ThumbRenderer::analyzeOne(const std::string& path, Analysis& out, const std
     out.sat = (float)(satSum / n);
     out.bright = (float)(valSum / n);
     out.motion = (float)std::min(1.0, motion / n * 6.0);
+    // punch: how strongly the picture's movement pulses with the kicks (the 2 Hz part of the frame-to-frame
+    // change, whatever the delay), plus how much busier it gets once the kicks start
+    auto avg = [&](int a0, int a1) { double s = 0; for (int f = a0; f <= a1; f++) s += D[f]; return s / (a1 - a0 + 1); };
+    const int k0 = frames - 45;  // exactly three kick periods of 15 frames
+    double dq = avg(12, 23), dk = avg(k0, frames - 1), cs = 0, sn = 0;
+    for (int f = k0; f < frames; f++) {
+        double ph = 2 * 3.14159265 * (f - 24) / 15.0;
+        cs += (D[f] - dk) * std::cos(ph), sn += (D[f] - dk) * std::sin(ph);
+    }
+    double amp = 2 * std::sqrt(cs * cs + sn * sn) / 45, pulse = amp / (dk + 0.002);
+    double react = std::max(0.0, (dk - dq) / (dk + dq + 1e-4));
+    double gate = std::min(1.0, dk / 0.003);  // nearly static presets do not punch
+    out.punch = (float)std::clamp((0.7 * std::min(1.0, pulse) + 0.3 * std::min(1.0, 2 * react)) * gate, 0.0, 1.0);
+    if (const char* lg = getenv("AMETHYST_PUNCH_LOG")) { if (FILE* pf = fopen(lg, "a")) { fprintf(pf, "%.5f %.5f %.3f %.3f %.3f\n", dq, dk, pulse, out.motion, out.punch); fclose(pf); } }
     return true;
 }
 

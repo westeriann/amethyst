@@ -56,6 +56,7 @@ void MusicStructure::trackChanged(double t, double beat) {
 }
 
 void MusicStructure::feed(const float* s, size_t frames, double t, double beat, double bpm) {
+    if (pinned_) return;
     const float a = 1.f - std::exp(-2.f * 3.14159265f * 150.f / (float)kRate);  // ~150 Hz low-pass for the kick
     double bps = std::max(30.0, bpm) / 60.0;
     for (size_t i = 0; i < frames; i++) {
