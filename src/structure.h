@@ -29,6 +29,7 @@ public:
     float energy() const;  // bass relative to the song's full level, 0..~1.5
     // tests: hold a section regardless of the audio (pin = false releases it)
     void debugPin(Section s, double beat, bool pin = true) { enter(s, beat); pinned_ = pin; }
+    void debugEmit(Event e, double beat, double t) { emit(e, beat, t); }
 
 private:
     Section sec_ = Silence;

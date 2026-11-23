@@ -71,6 +71,7 @@ struct Settings {
     int interval = 20;
     bool autoOn = false, shuffle = true, autoDecks = false, smartMix = true, fakeoutRecut = true, autoFx = true, autoFxFlash = true;
     float autoFxAmount = 0.7f;   // how hard Auto FX pushes the effects
+    float buildTease = 0.35f;    // how far the drop preset fades in during a build-up (0 = off)
     int quantize = 2;            // auto-pilot launch grid
     bool quantizeManual = false; // also quantize manual launches
     float gain = 1, speed = 1;
@@ -132,7 +133,7 @@ struct Field { const char* key; char type; void* p; };
 std::vector<Field> fields() {
     return {
         {"blend", 'f', &S.blend}, {"interval", 'i', &S.interval}, {"auto", 'b', &S.autoOn}, {"shuffle", 'b', &S.shuffle},
-        {"auto_decks", 'b', &S.autoDecks}, {"smart_mix", 'b', &S.smartMix}, {"fakeout_recut", 'b', &S.fakeoutRecut}, {"auto_fx", 'b', &S.autoFx}, {"auto_fx_flash", 'b', &S.autoFxFlash}, {"auto_fx_amount", 'f', &S.autoFxAmount}, {"quantize", 'i', &S.quantize}, {"quantize_manual", 'b', &S.quantizeManual},
+        {"auto_decks", 'b', &S.autoDecks}, {"smart_mix", 'b', &S.smartMix}, {"fakeout_recut", 'b', &S.fakeoutRecut}, {"auto_fx", 'b', &S.autoFx}, {"auto_fx_flash", 'b', &S.autoFxFlash}, {"auto_fx_amount", 'f', &S.autoFxAmount}, {"build_tease", 'f', &S.buildTease}, {"quantize", 'i', &S.quantize}, {"quantize_manual", 'b', &S.quantizeManual},
         {"gain", 'f', &S.gain}, {"speed", 'f', &S.speed}, {"quality", 'i', &S.quality}, {"xfade", 'f', &S.xfade}, {"mix_mode", 'i', &S.mixMode},
         {"show_menu", 'b', &S.showMenu}, {"show_browser", 'b', &S.showBrowser}, {"show_hud", 'b', &S.showHud}, {"show_cues", 'b', &S.showCues},
         {"show_toasts", 'b', &S.showToasts}, {"show_status", 'b', &S.showStatus}, {"show_mixer", 'b', &S.showMixer}, {"show_fx", 'b', &S.showFx},
@@ -229,6 +230,7 @@ struct Deck {
     bool pendingHold = false;       // keep the loaded preset ready on the spare until releaseHeld()
     int heldIdx = -1;               // preset waiting on the spare player
     double pendingBlendSecs = -1;   // blend override for this load (-1 = normal)
+    float blendManual = -1;         // >= 0: hold the blend at this amount (build-up tease), else time-based
     std::vector<std::string> hist;
     double time = 0, lastSwitch = 0;
     PresetPlayer& visible() { return players[active]; }
@@ -680,7 +682,7 @@ int pickRandom(int exclude) {
 bool loadPreset(int d, int idx, bool hard, bool record = true) {
     Deck& dk = decks[d];
     if (idx < 0 || idx >= (int)lib.size()) return false;
-    if (dk.blending) { dk.blending = false; }  // the spare is about to be reused: finish the running blend
+    if (dk.blending) { dk.blending = false; dk.blendManual = -1; }  // the spare is about to be reused: finish the running blend
     dk.pendingIdx = idx;
     dk.pendingToken = ++loadTokens;
     dk.pendingHard = hard;
@@ -1705,6 +1707,7 @@ void pickLook(const int* set, int n) {
     afx.lookBeat = beatNow();
 }
 int randomTransition() { return 1 + (int)(rng() % (TransitionCount - 1)); }
+int smoothTransition() { const int t[] = {TransBlend, TransDissolve, TransLuma, TransBlend}; return t[rng() % 4]; }
 
 void applyLook(int id, FxParams& f, float a, double beat, double dt) {
     float env = (float)std::exp(-(beat - std::floor(beat)) * 6);  // pulse on every beat
@@ -1766,7 +1769,7 @@ void autoFxEvent(MusicStructure::Event e) {
         case MusicStructure::SongStart: afx.startT = now(), afx.endT = -1e9; break;
         case MusicStructure::SongChange:
             pickLook(kGrooveLooks, 6);
-            afx.transition = randomTransition();
+            afx.transition = smoothTransition();
             break;
         case MusicStructure::SongEnd: afx.endT = now(); break;
     }
@@ -1784,7 +1787,7 @@ void autoFxApply(double t, double dt) {
     bool newPhrase = phrase != afx.lastPhrase;
     switch (sec) {
         case MusicStructure::Drop: {
-            if (newPhrase) pickLook(kDropLooks, 6), afx.transition = randomTransition();
+            if (newPhrase) pickLook(kDropLooks, 6);
             applyLook(afx.look, f, a, b, dt);
             f.zoom *= 1 + 0.06f * a * beatEnv;
             double k = b - afx.dropBeat;
@@ -1800,7 +1803,6 @@ void autoFxApply(double t, double dt) {
             if (newPhrase) {
                 pickLook(kGrooveLooks, 6);
                 autoFlash(0.3f * a);
-                afx.transition = randomTransition();
             }
             applyLook(afx.look, f, a * 0.6f, b, dt);
             f.zoom *= 1 + 0.04f * a * barEnv;
@@ -1850,6 +1852,7 @@ struct Smart {
     bool hard = false;
     double lastSwitch = 0;
     bool afterFake = false;  // between a fakeout and the real drop
+    bool peeking = false;    // the drop preset is already faded in a little (build-up tease)
     std::string lastEvent;
     double lastEventAt = -100;
 } smart;
@@ -1895,15 +1898,25 @@ void smartCancel() {
         if (dk.heldIdx == smart.idx) dk.heldIdx = -1;
         if (dk.pendingIdx == smart.idx && dk.pendingHold) { dk.pendingIdx = -1; dk.pendingToken = 0; dk.pendingHold = false; }
     }
+    if (smart.prep && smart.peeking) {  // a tease is showing: finish it gently instead of snapping back
+        if (S.autoDecks) startXfade(smart.deck ? 1.f : 0.f, 2.0);
+        else {
+            Deck& dk = decks[smart.deck];
+            dk.blendStart = now() - std::max(0.f, dk.blendManual) * 2.0, dk.blendDur = 2.0, dk.blendManual = -1;
+        }
+    }
+    smart.peeking = false;
     smart.prep = false;
 }
 bool smartValid() {
     Deck& dk = decks[smart.deck];
+    if (smart.peeking) return dk.cur == smart.idx;
     if (S.autoDecks) return dk.pendingIdx == smart.idx || dk.cur == smart.idx;
     return (dk.pendingIdx == smart.idx && dk.pendingHold) || dk.heldIdx == smart.idx;
 }
 bool smartReady() {
     Deck& dk = decks[smart.deck];
+    if (smart.peeking) return true;
     return S.autoDecks ? dk.pendingIdx < 0 && dk.cur == smart.idx : dk.heldIdx == smart.idx;
 }
 bool smartPrepare(int energy, int fireOn, double fireBeat, double blend, bool hard) {
@@ -1917,13 +1930,35 @@ bool smartPrepare(int energy, int fireOn, double fireBeat, double blend, bool ha
     smart.deck = d, smart.idx = idx, smart.fireOn = fireOn, smart.fireBeat = fireBeat, smart.blend = blend, smart.hard = hard;
     return true;
 }
+void smartPeek(float k) {  // fade the waiting drop preset in a little
+    if (!smart.prep || !smartReady()) return;
+    if (S.autoDecks) {
+        S.xfade = smart.deck ? k : 1 - k;
+    } else {
+        Deck& dk = decks[smart.deck];
+        if (!smart.peeking) {
+            releaseHeld(smart.deck, 0);
+            dk.blending = true;
+        }
+        dk.blendManual = k;
+    }
+    smart.peeking = true;
+}
 void smartFire(double t) {
     if (S.autoDecks) startXfade(smart.deck ? 1.f : 0.f, smart.hard ? 0.04 : smart.blend);
-    else releaseHeld(smart.deck, smart.hard ? 0 : smart.blend);
+    else if (smart.peeking) {
+        Deck& dk = decks[smart.deck];
+        float k = std::max(0.f, dk.blendManual);
+        dk.blendManual = -1;
+        if (smart.hard) dk.blending = false;
+        else dk.blendStart = now() - k * smart.blend, dk.blendDur = smart.blend;
+    } else releaseHeld(smart.deck, smart.hard ? 0 : smart.blend);
+    smart.peeking = false;
     smart.prep = false;
     smart.lastSwitch = t;
 }
 double barSeconds() { return 240.0 / std::max(30.0, tempo.bpm()); }
+double beatsToSec(double beats) { return beats * barSeconds() / 4; }
 int phraseBars() {
     double bars = S.interval / barSeconds();
     return bars >= 8 ? 8 : bars >= 4 ? 4 : bars >= 2 ? 2 : 1;
@@ -1946,12 +1981,12 @@ void smartTick(double t) {
                 if (smart.prep && smart.fireOn == 1 && smartReady()) smartFire(t);
                 else if (smartPrepare(1, 0, beat, 0, true)) smart.fireBeat = beat;  // cut as soon as it compiles
                 break;
-            case MusicStructure::BreakdownStart: smartPrepare(-1, 0, nextBar, barSeconds() * 4, false); break;
+            case MusicStructure::BreakdownStart: smartPrepare(-1, 0, nextBar, beatsToSec(16), false); break;  // long, soft
             case MusicStructure::SongStart:
                 if (smart.prep && smart.fireOn == 2 && smartReady()) smartFire(t);
-                else smartPrepare(0, 0, nextBar, transitionSeconds(), false);
+                else smartPrepare(0, 0, nextBar, beatsToSec(8), false);
                 break;
-            case MusicStructure::SongChange: smartPrepare(0, 0, nextBar, transitionSeconds(), false); break;
+            case MusicStructure::SongChange: smartPrepare(0, 0, nextBar, beatsToSec(8), false); break;
             case MusicStructure::SongEnd: smartPrepare(0, 2, 0, 0, true); break;
             case MusicStructure::Fakeout:  // that was not the real drop: get another one ready for it
                 smart.afterFake = true;
@@ -1971,8 +2006,12 @@ void smartTick(double t) {
             if (smartReady()) smartFire(t);
             else smart.fireBeat = structure.nextBoundary(beat, 1);  // still compiling: next bar
         } else if (smart.fireOn == 1 && !low) {  // breakdown ended without a clear drop
-            smart.fireOn = 0, smart.hard = false, smart.blend = transitionSeconds();
+            smart.fireOn = 0, smart.hard = false, smart.blend = beatsToSec(4);
             smart.fireBeat = structure.nextBoundary(beat, 1);
+        } else if (smart.fireOn == 1 && sec == MusicStructure::Build && S.buildTease > 0) {
+            // tension: the drop preset creeps in as the build-up rises, then snaps to full on the drop
+            float p = (float)std::clamp(structure.sectionBeats(beat) / 32.0, 0.0, 1.0);
+            if (p > 0.1f && !(afx.fakeBeat > afx.dropBeat && beat - afx.fakeBeat < 16)) smartPeek(S.buildTease * p * p);
         }
         return;
     }
@@ -1980,7 +2019,12 @@ void smartTick(double t) {
     if (low) {
         if (since > 2 && !(smart.afterFake && !S.fakeoutRecut)) smartPrepare(1, 1, 0, 0, true);  // have the drop preset ready
     } else if (sec != MusicStructure::Silence && since >= S.interval - 2) {
-        smartPrepare(0, 0, structure.nextBoundary(beat + lead, phraseBars()), transitionSeconds(), false);
+        // blend early so the new preset fully arrives on the phrase's first downbeat: two bars in a groove,
+        // a quick beat during a drop (keeps the energy), one bar elsewhere
+        double pre = sec == MusicStructure::Drop ? 1 : sec == MusicStructure::Groove ? 8 : 4;
+        double land = structure.nextBoundary(beat + lead + pre, phraseBars());
+        if (smartPrepare(0, 0, land - pre, beatsToSec(pre), false) && autoFxOn())
+            afx.transition = sec == MusicStructure::Drop ? (rng() % 2 ? TransZoom : TransGlitch) : smoothTransition();
     }
 }
 
@@ -2143,12 +2187,13 @@ void renderFrame(double t, double dt) {
         if (dk.spare().loading() || dk.blending) dk.spare().requestFrame(dk.time, w, h);
         unsigned cur = dk.visible().texture();
         if (dk.blending) {
-            float k = (float)std::clamp((t - dk.blendStart) / std::max(0.01, dk.blendDur), 0.0, 1.0);
+            float k = dk.blendManual >= 0 ? dk.blendManual : (float)std::clamp((t - dk.blendStart) / std::max(0.01, dk.blendDur), 0.0, 1.0);
+            float e = dk.blendManual >= 0 ? k : k * k * k * (k * (k * 6 - 15) + 10);  // smootherstep: gentle in, gentle out
             dk.rt.ensure(w, h);
-            if (autoFxOn() && afx.transition > 0) gfx.transition(dk.rt, dk.spare().texture(), cur, k * k * (3 - 2 * k), afx.transition, (float)t);
-            else gfx.mix(dk.rt, dk.spare().texture(), cur, k * k * (3 - 2 * k), MixCrossfade);
+            if (autoFxOn() && afx.transition > 0) gfx.transition(dk.rt, dk.spare().texture(), cur, e, afx.transition, (float)t);
+            else gfx.mix(dk.rt, dk.spare().texture(), cur, e, MixCrossfade);
             dk.outTex = dk.rt.tex;
-            if (k >= 1) dk.blending = false;
+            if (dk.blendManual < 0 && k >= 1) dk.blending = false;
         } else {
             dk.outTex = cur;
         }
@@ -3363,6 +3408,10 @@ void drawMixer() {
                           "goes calm with a long blend in breakdowns, and changes when a new song starts.");
     if (S.smartMix) {
         ImGui::Checkbox("After a fakeout, switch again on the real drop", &S.fakeoutRecut);
+        ImGui::SetNextItemWidth(140);
+        ImGui::SliderFloat("Build-up tease", &S.buildTease, 0.f, 0.6f, "%.2f");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("During a build-up the drop preset slowly fades in up to this much,\nthen snaps to full on the drop. 0 = off.");
         ImGui::Checkbox("Auto FX: effects follow the song", &S.autoFx);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("While auto-pilot runs: flash, zoom punch and strobe on drops, risers in build-ups,\n"
@@ -4810,6 +4859,12 @@ void buildSelftest() {
         S.autoOn = true, S.autoFx = true, S.autoFxAmount = 0.8f, S.showMixer = false;
         structure.debugPin(MusicStructure::Build, beatNow() - 28);
     });
+    at(3.0, [] {  // the drop preset should have been loaded and be teasing in
+        Deck& dk = decks[smart.deck < 0 ? 0 : smart.deck];
+        testNote("build tease: prep=" + std::to_string(smart.prep) + " peeking=" + std::to_string(smart.peeking) +
+                 " amount=" + std::to_string(S.autoDecks ? S.xfade : dk.blendManual));
+        pendingShot = "20b-build-tease";
+    });
     at(1.2, [] {
         testNote("autofx build: zoom=" + std::to_string(modOut.fx.zoom) + " swirl=" + std::to_string(modOut.fx.swirl) +
                  " rgb=" + std::to_string(modOut.fx.rgbSplitAmount));
@@ -4817,11 +4872,13 @@ void buildSelftest() {
     });
     at(0.5, [] {
         structure.debugPin(MusicStructure::Drop, beatNow());
-        autoFxEvent(MusicStructure::DropHit);
+        structure.debugEmit(MusicStructure::DropHit, beatNow(), now());
     });
     at(0.1, [] {
         testNote("autofx drop: look=" + std::string(kLookNames[afx.look]) + " zoom=" + std::to_string(modOut.fx.zoom) +
                  " flash=" + std::to_string(flashAmt) + " transition=" + std::to_string(afx.transition));
+        Deck& dk = decks[smart.deck < 0 ? 0 : smart.deck];
+        testNote("drop cut: blending=" + std::to_string(dk.blending) + " manual=" + std::to_string(dk.blendManual) + " prep=" + std::to_string(smart.prep));
         pendingShot = "22-autofx-drop";
     });
     at(1.5, [] { pendingShot = "23-autofx-drop-later"; });
@@ -5102,7 +5159,7 @@ int main(int argc, char** argv) {
         // crossfade animation
         if (xanim.active) {
             float k = (float)std::clamp((t - xanim.start) / xanim.dur, 0.0, 1.0);
-            k = k * k * (3 - 2 * k);
+            k = k * k * k * (k * (k * 6 - 15) + 10);  // smootherstep
             S.xfade = xanim.from + (xanim.to - xanim.from) * k;
             if (k >= 1) xanim.active = false;
         }
