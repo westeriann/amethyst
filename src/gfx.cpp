@@ -191,6 +191,23 @@ unsigned compileProgram(const char* vs, const char* fs, const char* name) {
     return p;
 }
 
+const char* kUserHeader = R"(#version 330 core
+in vec2 uv;
+out vec4 amethystOut;
+uniform sampler2D iChannel0;  // the picture so far
+uniform sampler2D iChannel1;  // this effect's previous output (feedback)
+uniform vec3 iResolution;
+uniform float iTime, iBeat, iBeatPhase, iBass, iMid, iTreble, iLevel, iAmount, iDrop, iVocal;
+uniform int iFrame;
+)";
+const char* kUserFooter = R"(
+void main() {
+    vec4 c = vec4(0.0);
+    mainImage(c, uv * iResolution.xy);
+    amethystOut = vec4(mix(texture(iChannel0, uv).rgb, c.rgb, clamp(iAmount, 0.0, 1.0)), 1.0);
+}
+)";
+
 void bindTex(int unit, unsigned tex) {
     glActiveTexture(GL_TEXTURE0 + unit);
     glBindTexture(GL_TEXTURE_2D, tex);
@@ -374,3 +391,70 @@ void Gfx::present(unsigned tex, int x, int y, int w, int h, const float* c, bool
     glUniform1f(glGetUniformLocation(presentP_, "flipY"), flipY ? 1.f : 0.f);
     glDrawArrays(GL_TRIANGLES, 0, 3);
 }
+
+void Gfx::userFx(RenderTarget& out, unsigned prog, unsigned src, unsigned prev, const UserFxParams& p) {
+    out.bind();
+    glUseProgram(prog);
+    glBindVertexArray(vao_);
+    bindTex(0, src);
+    bindTex(1, prev);
+    glUniform1i(glGetUniformLocation(prog, "iChannel0"), 0);
+    glUniform1i(glGetUniformLocation(prog, "iChannel1"), 1);
+    glUniform3f(glGetUniformLocation(prog, "iResolution"), (float)out.w, (float)out.h, 1.f);
+    glUniform1f(glGetUniformLocation(prog, "iTime"), p.time);
+    glUniform1f(glGetUniformLocation(prog, "iBeat"), p.beat);
+    glUniform1f(glGetUniformLocation(prog, "iBeatPhase"), p.beatPhase);
+    glUniform1f(glGetUniformLocation(prog, "iBass"), p.bass);
+    glUniform1f(glGetUniformLocation(prog, "iMid"), p.mid);
+    glUniform1f(glGetUniformLocation(prog, "iTreble"), p.treble);
+    glUniform1f(glGetUniformLocation(prog, "iLevel"), p.level);
+    glUniform1f(glGetUniformLocation(prog, "iAmount"), p.amount);
+    glUniform1f(glGetUniformLocation(prog, "iDrop"), p.drop);
+    glUniform1f(glGetUniformLocation(prog, "iVocal"), p.vocal);
+    glUniform1i(glGetUniformLocation(prog, "iFrame"), p.frame);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+}
+
+unsigned Gfx::compileUser(const std::string& src, std::string& err) {
+    auto sh = [&](GLenum t, const std::string& s, bool& ok) {
+        GLuint hnd = glCreateShader(t);
+        const char* p = s.c_str();
+        glShaderSource(hnd, 1, &p, nullptr);
+        glCompileShader(hnd);
+        GLint st = 0;
+        glGetShaderiv(hnd, GL_COMPILE_STATUS, &st);
+        ok = st != 0;
+        if (!ok) {
+            char log[4096];
+            glGetShaderInfoLog(hnd, sizeof log, nullptr, log);
+            err = log;
+        }
+        return hnd;
+    };
+    bool okV = false, okF = false;
+    GLuint vs = sh(GL_VERTEX_SHADER, kVs, okV);
+    GLuint fs = sh(GL_FRAGMENT_SHADER, std::string(kUserHeader) + "#line 1\n" + src + kUserFooter, okF);
+    if (!okV || !okF) {
+        glDeleteShader(vs);
+        glDeleteShader(fs);
+        return 0;
+    }
+    GLuint p = glCreateProgram();
+    glAttachShader(p, vs);
+    glAttachShader(p, fs);
+    glLinkProgram(p);
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    GLint linked = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &linked);
+    if (!linked) {
+        char log[2048];
+        glGetProgramInfoLog(p, sizeof log, nullptr, log);
+        err = log;
+        glDeleteProgram(p);
+        return 0;
+    }
+    err.clear();
+    return p;
+}
+

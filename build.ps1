@@ -33,6 +33,7 @@ foreach ($d in $dlls) {
   Copy-Item $win $dist -Force
 }
 Copy-Item (Join-Path $root 'presets') (Join-Path $dist 'presets') -Recurse
+Copy-Item (Join-Path $root 'shaders') (Join-Path $dist 'shaders') -Recurse
 New-Item -ItemType Directory -Force (Join-Path $dist 'textures') | Out-Null
 New-Item -ItemType Directory -Force (Join-Path $dist 'licenses') | Out-Null
 Copy-Item (Join-Path $root 'third_party\projectm\LICENSE.txt') (Join-Path $dist 'licenses\projectM-LGPL-2.1.txt')

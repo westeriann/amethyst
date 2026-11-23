@@ -27,6 +27,10 @@ public:
     double nextBoundary(double beat, int bars) const;  // next beat that starts a block of `bars` bars
     double sectionBeats(double beat) const { return beat - secBeat_; }
     float energy() const;  // bass relative to the song's full level, 0..~1.5
+    // Vocals: a single pitched line in the voice range that glides/wobbles. 0..1, smoothed.
+    float vocal() const { return vocalAmt_; }
+    bool vocalsOn() const { return vocalOn_; }
+    float pitchClarity() const { return clarity_; }
     // tests: hold a section regardless of the audio (pin = false releases it)
     void debugPin(Section s, double beat, bool pin = true) { enter(s, beat); pinned_ = pin; }
     void debugEmit(Event e, double beat, double t) { emit(e, beat, t); }
@@ -51,6 +55,12 @@ private:
     float dropLevel_ = 0;
     bool fakeUsed_ = false;  // one fakeout per drop: stop-start bass after it is the drop's rhythm
     float peakOf(long long b) const;
+    // vocal detector (works on a 200 Hz - 3.5 kHz band, downsampled to 12 kHz)
+    float vhp_ = 0, vhpIn_ = 0, vlp_ = 0, vAcc_ = 0, clarity_ = 0, vocalAmt_ = 0, lastPitch_ = 0;
+    int vN_ = 0, vHead_ = 0, vSince_ = 0;
+    float vRing_[1024] = {};
+    bool vocalOn_ = false;
+    void vocalStep();
     // hop accumulator
     double accB_ = 0, accA_ = 0;
     int accN_ = 0;

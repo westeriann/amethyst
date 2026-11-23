@@ -47,6 +47,38 @@ double MusicStructure::nextBoundary(double beat, int bars) const {
 }
 float MusicStructure::energy() const { return bassRef_ > 1e-4f ? bassM_ / bassRef_ : 0.f; }
 
+// Pitch clarity by normalised autocorrelation over 85 ms (100..800 Hz). Voices are clear AND their
+// pitch keeps moving a little (glides, vibrato); synth leads tend to hold dead-steady notes.
+void MusicStructure::vocalStep() {
+    const int N = 1024, W = 768;
+    float x[1024];
+    double e = 0;
+    for (int i = 0; i < N; i++) x[i] = vRing_[(vHead_ + i) & 1023], e += x[i] * x[i];
+    float clar = 0;
+    int bestL = 0;
+    if (e / N > 1e-7) {
+        double e0 = 0;
+        for (int i = 0; i < W; i++) e0 += x[i] * x[i];
+        for (int L = 15; L <= 120; L++) {
+            double r = 0, eL = 0;
+            for (int i = 0; i < W; i++) r += x[i] * x[i + L], eL += x[i + L] * x[i + L];
+            float v = (float)(r / std::sqrt(e0 * eL + 1e-12));
+            if (v > clar) clar = v, bestL = L;
+        }
+    }
+    clarity_ += (clar - clarity_) * 0.3f;
+    float pitch = bestL ? 12000.f / bestL : 0;
+    float score = 0;
+    if (clar > 0.55f && pitch > 0) {
+        float ch = lastPitch_ > 0 ? std::fabs(pitch / lastPitch_ - 1) : 1;
+        score = ch > 0.004f && ch < 0.08f ? 1.f : ch <= 0.004f ? 0.35f : 0.5f;  // moving a little = voice-like
+    }
+    lastPitch_ = clar > 0.55f ? pitch : 0;
+    vocalAmt_ += (score - vocalAmt_) * 0.06f;  // ~0.7 s smoothing
+    if (!vocalOn_ && vocalAmt_ > 0.45f) vocalOn_ = true;
+    else if (vocalOn_ && vocalAmt_ < 0.25f) vocalOn_ = false;
+}
+
 void MusicStructure::trackChanged(double t, double beat) {
     emit(SongChange, beat, t);
     anchored_ = false;
@@ -64,6 +96,17 @@ void MusicStructure::feed(const float* s, size_t frames, double t, double beat, 
         lp_ += a * (m - lp_);
         accB_ += lp_ * lp_;
         accA_ += m * m;
+        // vocal band: one-pole high-pass ~200 Hz, low-pass ~3.5 kHz, then 4:1 down to 12 kHz
+        vhp_ = 0.974f * (vhp_ + m - vhpIn_);
+        vhpIn_ = m;
+        vlp_ += 0.37f * (vhp_ - vlp_);
+        vAcc_ += vlp_;
+        if (++vN_ == 4) {
+            vRing_[vHead_] = vAcc_ * 0.25f;
+            vHead_ = (vHead_ + 1) & 1023;
+            vAcc_ = 0, vN_ = 0;
+            if (++vSince_ >= 512) vSince_ = 0, vocalStep();  // ~23 times a second
+        }
         if (++accN_ == kHop) {
             double dt = kHop / kRate, off = (i + 1) / kRate;
             hop((float)std::sqrt(accB_ / kHop), (float)std::sqrt(accA_ / kHop), t + off, beat + off * bps, bpm, dt);

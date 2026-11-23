@@ -76,6 +76,10 @@ struct Settings {
     bool watchdog = true;        // show safety: skip presets that go black, freeze or crawl
     std::string safePreset;      // fallback preset for the watchdog and the panic button
     std::string autoFolder;      // auto-pilot only picks presets inside this folder (empty = anywhere)
+    bool vocalEase = true;       // calmer effects and no mid-line switches while someone sings
+    std::string userShader;      // custom shader effect picked by hand ("" = none)
+    float userShaderAmount = 0.8f;
+    bool autoFxShaders = true;   // Auto FX may use custom shaders on drops and phrases
     int quantize = 2;            // auto-pilot launch grid
     bool quantizeManual = false; // also quantize manual launches
     float gain = 1, speed = 1;
@@ -137,7 +141,7 @@ struct Field { const char* key; char type; void* p; };
 std::vector<Field> fields() {
     return {
         {"blend", 'f', &S.blend}, {"interval", 'i', &S.interval}, {"auto", 'b', &S.autoOn}, {"shuffle", 'b', &S.shuffle},
-        {"auto_decks", 'b', &S.autoDecks}, {"smart_mix", 'b', &S.smartMix}, {"fakeout_recut", 'b', &S.fakeoutRecut}, {"auto_fx", 'b', &S.autoFx}, {"auto_fx_flash", 'b', &S.autoFxFlash}, {"auto_fx_amount", 'f', &S.autoFxAmount}, {"build_tease", 'f', &S.buildTease}, {"smart_blends", 'b', &S.smartBlends}, {"watchdog", 'b', &S.watchdog}, {"safe_preset", 's', &S.safePreset}, {"auto_folder", 's', &S.autoFolder}, {"quantize", 'i', &S.quantize}, {"quantize_manual", 'b', &S.quantizeManual},
+        {"auto_decks", 'b', &S.autoDecks}, {"smart_mix", 'b', &S.smartMix}, {"fakeout_recut", 'b', &S.fakeoutRecut}, {"auto_fx", 'b', &S.autoFx}, {"auto_fx_flash", 'b', &S.autoFxFlash}, {"auto_fx_amount", 'f', &S.autoFxAmount}, {"build_tease", 'f', &S.buildTease}, {"smart_blends", 'b', &S.smartBlends}, {"watchdog", 'b', &S.watchdog}, {"safe_preset", 's', &S.safePreset}, {"auto_folder", 's', &S.autoFolder}, {"vocal_ease", 'b', &S.vocalEase}, {"user_shader", 's', &S.userShader}, {"user_shader_amt", 'f', &S.userShaderAmount}, {"auto_fx_shaders", 'b', &S.autoFxShaders}, {"quantize", 'i', &S.quantize}, {"quantize_manual", 'b', &S.quantizeManual},
         {"gain", 'f', &S.gain}, {"speed", 'f', &S.speed}, {"quality", 'i', &S.quality}, {"xfade", 'f', &S.xfade}, {"mix_mode", 'i', &S.mixMode},
         {"show_menu", 'b', &S.showMenu}, {"show_browser", 'b', &S.showBrowser}, {"show_hud", 'b', &S.showHud}, {"show_cues", 'b', &S.showCues},
         {"show_toasts", 'b', &S.showToasts}, {"show_status", 'b', &S.showStatus}, {"show_mixer", 'b', &S.showMixer}, {"show_fx", 'b', &S.showFx},
@@ -305,6 +309,14 @@ double beatsToSec(double beats);
 void panicSafe();
 void startXfade(float to, double dur);
 MusicStructure structure;
+// custom shader effects (ShaderToy-style .glsl files)
+struct UserShader {
+    std::string name, path, err;
+    unsigned prog = 0;
+    bool tried = false;
+    long long mtime = 0;
+};
+std::vector<UserShader> userShaders;
 int xfadeOnLoad = -1;  // A/B auto-mix: crossfade to this deck once its preset has compiled
 double xfadeOnLoadSecs = 0;
 std::string captureAction;        // keyboard editor: next key press gets bound to this action
@@ -1149,8 +1161,9 @@ void captureForRecording(double dt) {
 void saveScenes();
 
 // ---- modulation routing
-enum ModSrc { SrcBass, SrcMid, SrcTreble, SrcLevel, SrcBeat, SrcLfoSine, SrcLfoSaw, SrcLfoSquare, SrcLfoRandom, SrcCount };
-const char* kModSrcNames[] = {"Bass", "Mids", "Treble", "Level", "Beat pulse", "LFO sine", "LFO saw", "LFO square", "LFO random"};
+enum ModSrc { SrcBass, SrcMid, SrcTreble, SrcLevel, SrcBeat, SrcLfoSine, SrcLfoSaw, SrcLfoSquare, SrcLfoRandom, SrcVocal, SrcEnergy, SrcCount };
+const char* kModSrcNames[] = {"Bass", "Mids", "Treble", "Level", "Beat pulse", "LFO sine", "LFO saw", "LFO square", "LFO random", "Vocals", "Song energy"};
+bool isLfo(int src) { return src >= SrcLfoSine && src <= SrcLfoRandom; }
 enum ModDst { DstZoom, DstRotate, DstSwirl, DstHue, DstSat, DstContrast, DstBright, DstRgb, DstFeedback, DstPixel, DstKaleido,
               DstCrossfade, DstVideoOpacity, DstLogoOpacity, DstTextOpacity, DstCount };
 const char* kModDstNames[] = {"Zoom", "Rotate", "Swirl", "Hue", "Saturation", "Contrast", "Brightness", "RGB split", "Feedback trails",
@@ -1170,6 +1183,8 @@ float modSource(int src, double beat) {
         case SrcTreble: return bandTreb;
         case SrcLevel: return bandLevel;
         case SrcBeat: { float f = 1 - frac(beat); return f * f; }
+        case SrcVocal: return structure.vocal();
+        case SrcEnergy: return std::min(1.f, structure.energy());
         default: break;
     }
     return 0;
@@ -1190,7 +1205,7 @@ void applyModulation(double beat) {
     ModOut m{S.fx, S.xfade, 0, S.videoOpacity, S.logoOpacity, S.textOpacity};
     for (auto& r : mods) {
         if (!r.on) { r.state = 0; continue; }
-        float v = r.src >= SrcLfoSine ? lfo(r.src, beat, r.rate) : modSource(r.src, beat);
+        float v = isLfo(r.src) ? lfo(r.src, beat, r.rate) : modSource(r.src, beat);
         r.state += (v - r.state) * (1 - std::clamp(r.smooth, 0.f, 0.97f));
         float a = r.amount * r.state;
         FxParams& f = m.fx;
@@ -1745,6 +1760,7 @@ struct AutoFx {
     double lookBeat = 0, dropBeat = -1e9, fakeBeat = -1e9, startT = -1e9, endT = -1e9;
     float rot = 0, white = 0, black = 0;
     int transition = -1;  // style for preset switches (-1 = the user's own setting)
+    int shader = -1;      // custom shader Auto FX is using (-1 = none)
     long long lastPhrase = -(1LL << 40);
 } afx;
 bool autoFxOn() { return S.autoOn && S.autoFx; }
@@ -1803,9 +1819,14 @@ void applyLook(int id, FxParams& f, float a, double beat, double dt) {
     }
 }
 
+void autoShaderPick(int chanceOutOf10) {
+    afx.shader = S.autoFxShaders && !userShaders.empty() && (int)(rng() % 10) < chanceOutOf10 ? (int)(rng() % userShaders.size()) : -1;
+}
 void autoFxEvent(MusicStructure::Event e) {
     if (!autoFxOn()) return;
     float a = S.autoFxAmount;
+    if (e == MusicStructure::DropHit) autoShaderPick(7);
+    if (e == MusicStructure::BreakdownStart || e == MusicStructure::SongEnd) afx.shader = -1;
     switch (e) {
         case MusicStructure::DropHit:
             afx.dropBeat = beatNow();
@@ -1838,6 +1859,7 @@ void autoFxApply(double t, double dt) {
     auto sec = structure.section();
     long long phrase = (long long)std::floor(structure.nextBoundary(b, 8));
     bool newPhrase = phrase != afx.lastPhrase;
+    if (S.vocalEase && sec != MusicStructure::Drop && sec != MusicStructure::Build) a *= 1 - 0.45f * structure.vocal();
     switch (sec) {
         case MusicStructure::Drop: {
             if (newPhrase) pickLook(kDropLooks, 6);
@@ -1855,7 +1877,8 @@ void autoFxApply(double t, double dt) {
         case MusicStructure::Groove:
             if (newPhrase) {
                 pickLook(kGrooveLooks, 6);
-                autoFlash(0.3f * a);
+                autoShaderPick(3);
+                if (!(S.vocalEase && structure.vocalsOn())) autoFlash(0.3f * a);
             }
             applyLook(afx.look, f, a * 0.6f, b, dt);
             f.zoom *= 1 + 0.04f * a * barEnv;
@@ -2095,7 +2118,8 @@ void smartTick(double t) {
     double since = t - std::max(smart.lastSwitch, decks[onAirDeck()].lastSwitch);
     if (low) {
         if (since > 2 && !(smart.afterFake && !S.fakeoutRecut)) smartPrepare(1, 1, 0, 0, true);  // have the drop preset ready
-    } else if (sec != MusicStructure::Silence && since >= S.interval - 2) {
+    } else if (sec != MusicStructure::Silence && since >= S.interval - 2 &&
+               !(S.vocalEase && structure.vocalsOn() && since < S.interval * 2)) {  // let the singer finish the line
         // blend early so the new preset fully arrives on the phrase's first downbeat: two bars in a groove,
         // a quick beat during a drop (keeps the energy), one bar elsewhere
         double pre = sec == MusicStructure::Drop ? 1 : sec == MusicStructure::Groove ? 8 : 4;
@@ -2238,6 +2262,70 @@ void drawOverlays(RenderTarget& rt, double t) {
 }
 
 // ===================================================================== render pipeline
+std::string userShaderDir() { return plat::documentsDir() + "\\Amethyst\\Shaders"; }
+long long fileStamp(const std::string& p) {
+    std::error_code ec;
+    auto t = fs::last_write_time(fs::u8path(p), ec);
+    return ec ? 0 : (long long)t.time_since_epoch().count();
+}
+void scanShaders() {
+    for (auto& u : userShaders) if (u.prog) glDeleteProgram(u.prog);
+    userShaders.clear();
+    std::error_code ec;
+    fs::create_directories(fs::u8path(userShaderDir()), ec);
+    std::string readme = userShaderDir() + "\\README.txt";
+    if (!fs::exists(fs::u8path(readme))) {
+        std::ofstream r(fs::u8path(readme));
+        r << "Put your own effects here as .glsl files. Write them like ShaderToy:\n\n"
+             "  void mainImage(out vec4 fragColor, in vec2 fragCoord) { ... }\n\n"
+             "Inputs: iChannel0 (the picture), iChannel1 (this effect's last output, for trails),\n"
+             "iResolution, iTime, iFrame, iBeat, iBeatPhase (0..1 within the beat), iBass, iMid, iTreble, iLevel,\n"
+             "iDrop (1 on a drop, fading out), iVocal. Amethyst blends the result with the Amount slider.\n"
+             "Saving a file reloads it instantly. The bundled examples are in the 'shaders' folder next to Amethyst.exe.\n";
+    }
+    std::map<std::string, std::string> found;  // name -> path; your folder wins over the bundled one
+    for (const std::string& dir : {plat::exeDir() + "\\shaders", userShaderDir()})
+        for (fs::directory_iterator it(fs::u8path(dir), ec), end; !ec && it != end; it.increment(ec))
+            if (it->path().extension() == ".glsl") found[it->path().stem().u8string()] = it->path().u8string();
+    for (auto& [n, p] : found) userShaders.push_back({n, p});
+}
+bool ensureShader(UserShader& u) {
+    long long st = fileStamp(u.path);
+    if (u.tried && st == u.mtime) return u.prog != 0;
+    u.tried = true;
+    u.mtime = st;
+    std::ifstream f(fs::u8path(u.path), std::ios::binary);
+    std::string src((std::istreambuf_iterator<char>(f)), {});
+    std::string err;
+    unsigned p = gfx.compileUser(src, err);
+    if (p) {
+        if (u.prog) glDeleteProgram(u.prog);
+        u.prog = p;
+        u.err.clear();
+    } else {
+        u.err = err;
+        toast(true, "Shader %s: %s", u.name.c_str(), err.substr(0, 160).c_str());
+    }
+    return u.prog != 0;
+}
+int shaderIndex(const std::string& name) {
+    for (size_t i = 0; i < userShaders.size(); i++) if (userShaders[i].name == name) return (int)i;
+    return -1;
+}
+// which custom shader runs this frame, and how strongly
+int activeShader(float& amount) {
+    int m = S.userShader.empty() ? -1 : shaderIndex(S.userShader);
+    if (m >= 0) { amount = S.userShaderAmount; return m; }
+    if (autoFxOn() && S.autoFxShaders && afx.shader >= 0 && afx.shader < (int)userShaders.size()) {
+        amount = S.autoFxAmount * (structure.section() == MusicStructure::Drop ? 0.9f : 0.6f);
+        return afx.shader;
+    }
+    return -1;
+}
+RenderTarget userRT[2];
+int userIdx = 0, userFrame = 0;
+double lastShaderCheck = 0;
+
 void renderFrame(double t, double dt) {
     int w, h;
     SDL_GL_GetDrawableSize(outputs.empty() ? win : outputs[0].win, &w, &h);
@@ -2295,14 +2383,38 @@ void renderFrame(double t, double dt) {
     int prev = fxIdx;
     fxIdx = 1 - fxIdx;
     gfx.fx(fxRT[fxIdx], mixRT.tex, fxRT[prev].tex, modOut.fx, fxRotation + modOut.rotOffset, (float)t);
-    drawOverlays(fxRT[fxIdx], t);
+    RenderTarget* post = &fxRT[fxIdx];
+    {
+        float amt = 0;
+        int us = activeShader(amt);
+        if (us >= 0 && (t - lastShaderCheck > 1 || !userShaders[us].tried)) {  // hot reload when the file is saved
+            lastShaderCheck = t;
+            ensureShader(userShaders[us]);
+        }
+        if (us >= 0 && userShaders[us].prog && amt > 0.01f) {
+            int prevU = userIdx;
+            userIdx = 1 - userIdx;
+            for (auto& r : userRT) r.ensure(w, h);
+            UserFxParams p;
+            double b = beatNow();
+            p.time = (float)t, p.beat = (float)b, p.beatPhase = (float)(b - std::floor(b));
+            p.bass = bandBass, p.mid = bandMid, p.treble = bandTreb, p.level = bandLevel, p.amount = amt;
+            double sinceDrop = b - afx.dropBeat;
+            p.drop = sinceDrop >= 0 && sinceDrop < 8 ? (float)std::exp(-sinceDrop / 2) : 0.f;
+            p.vocal = structure.vocal();
+            p.frame = userFrame++;
+            gfx.userFx(userRT[userIdx], userShaders[us].prog, fxRT[fxIdx].tex, userRT[prevU].tex, p);
+            post = &userRT[userIdx];
+        }
+    }
+    drawOverlays(*post, t);
     // strobe: on-beat or free-running white flashes (short duty cycle)
     float strobe = 0;
     if (modOut.fx.strobe) {
         double ph = S.fx.strobeOnBeat ? std::fmod(beatNow() * std::max(1.f, S.fx.strobeRate / 4.f), 1.0) : std::fmod(t * S.fx.strobeRate, 1.0);
         strobe = ph < 0.25 ? 1.f : 0.f;
     }
-    gfx.finalize(finalRT, fxRT[fxIdx].tex, std::max(blackAmt, afx.black), std::max({flashAmt, strobe, afx.white}));
+    gfx.finalize(finalRT, post->tex, std::max(blackAmt, afx.black), std::max({flashAmt, strobe, afx.white}));
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     if (S.spout) {
         if (!spoutNamed) { spout.SetSenderName("Amethyst"); spoutNamed = true; }
@@ -2383,6 +2495,13 @@ void registerActions() {
     toggle("blackout", "Blackout", "Performance", &blackoutOn);
     trig("flash", "Flash", "Performance", [] { flashAmt = 1; });
     trig("safe_now", "Safe preset now (panic)", "Performance", [] { panicSafe(); });
+    trig("shader_next", "Next custom shader", "FX", [] {
+        if (userShaders.empty()) { toast(true, "No custom shaders — add .glsl files to Documents\\Amethyst\\Shaders"); return; }
+        int i = shaderIndex(S.userShader);
+        S.userShader = i + 1 >= (int)userShaders.size() ? "" : userShaders[i + 1].name;
+        toast(false, "Shader: %s", S.userShader.empty() ? "none" : S.userShader.c_str());
+    });
+    cont("shader_amount", "Shader amount", "FX", [](float v) { S.userShaderAmount = v; }, [] { return S.userShaderAmount; });
     toggle("watchdog", "Show safety watchdog", "Performance", &S.watchdog);
     { Action a; a.id = "freeze"; a.label = "Freeze (hold)"; a.group = "Performance"; a.kind = Action::Momentary;
       a.set = [](float v) { frozen = v > 0.5f; }; a.get = [] { return frozen ? 1.f : 0.f; }; actions.add(a); }
@@ -3093,12 +3212,17 @@ void drawAutoMenu() {
         ImGui::SetNextItemWidth(160);
         ImGui::Combo("Launch on", &S.quantize, kQuantizeNames, 4);
     }
+    ImGui::Checkbox("Calmer while vocals", &S.vocalEase);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("While someone sings: softer Auto FX, no phrase flashes,\nand switches wait for the vocal line to finish.");
+    ImGui::SameLine();
+    ImGui::TextDisabled(structure.vocalsOn() ? "(vocals now)" : "");
     ImGui::SeparatorText("Auto FX");
     ImGui::Checkbox("Effects follow the song", &S.autoFx);
     ImGui::BeginDisabled(!S.autoFx);
     ImGui::SetNextItemWidth(160);
     ImGui::SliderFloat("Strength", &S.autoFxAmount, 0.f, 1.f, "%.2f");
     ImGui::Checkbox("Flashes & strobes", &S.autoFxFlash);
+    ImGui::Checkbox("Use custom shaders", &S.autoFxShaders);
     ImGui::EndDisabled();
     ImGui::SeparatorText("Safety");
     ImGui::Checkbox("Show safety watchdog", &S.watchdog);
@@ -3526,7 +3650,8 @@ void drawHud(float y, float h) {
     double left = std::max(0.0, S.interval - since);
     double hb = beatNow();
     if (S.autoOn && S.smartMix)
-        snprintf(b, sizeof b, "AUTO smart  %s  bar %d/8%s%s%s%s", MusicStructure::name(structure.section()), structure.barInPhrase(hb) + 1,
+        snprintf(b, sizeof b, "AUTO smart  %s%s  bar %d/8%s%s%s%s", MusicStructure::name(structure.section()), structure.vocalsOn() ? " + vox" : "",
+                 structure.barInPhrase(hb) + 1,
                  S.autoFx ? " +FX" : "", S.autoDecks ? ", A/B mix" : "", S.autoFolder.empty() ? "" : ("  in " + fs::u8path(S.autoFolder).filename().u8string()).c_str(),
                  keyHint("auto").c_str());
     else if (S.autoOn) snprintf(b, sizeof b, "AUTO %s  %s%s%s", locked ? "--" : (std::to_string((int)std::ceil(left)) + "s").c_str(), S.shuffle ? "shuffle" : "in order", S.autoDecks ? ", A/B mix" : "", keyHint("auto").c_str());
@@ -3656,6 +3781,27 @@ void drawMixer() {
 void drawFx() {
     ImGui::SetNextWindowSize(ImVec2(420, 560), ImGuiCond_FirstUseEver);
     if (!ImGui::Begin("Effects", &S.showFx, ImGuiWindowFlags_NoCollapse)) { ImGui::End(); return; }
+    if (ImGui::CollapsingHeader("Custom shaders", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::SetNextItemWidth(220);
+        if (ImGui::BeginCombo("Shader", S.userShader.empty() ? "None" : S.userShader.c_str())) {
+            if (ImGui::Selectable("None", S.userShader.empty())) S.userShader.clear();
+            for (auto& u : userShaders)
+                if (ImGui::Selectable(u.name.c_str(), S.userShader == u.name)) S.userShader = u.name;
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Reload")) scanShaders();
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Folder")) plat::openPath(userShaderDir());
+        ImGui::SetNextItemWidth(220);
+        ImGui::SliderFloat("Amount##us", &S.userShaderAmount, 0.f, 1.f, "%.2f");
+        int si = shaderIndex(S.userShader);
+        if (si >= 0 && !userShaders[si].err.empty()) ImGui::TextColored(kHot, "%s", userShaders[si].err.c_str());
+        float amt = 0;
+        int ai = activeShader(amt);
+        if (S.userShader.empty()) ImGui::TextDisabled(ai >= 0 ? ("Auto FX is using: " + userShaders[ai].name).c_str() : "Auto FX picks shaders on drops when this is None.");
+        ImGui::TextDisabled("%d shaders. Add your own .glsl files (ShaderToy style) to Documents\\Amethyst\\Shaders.", (int)userShaders.size());
+    }
     FxParams& f = S.fx;
     ImGui::Checkbox("Kaleidoscope  F2", &f.kaleido); ImGui::SameLine(220); ImGui::SetNextItemWidth(-1); ImGui::SliderInt("##ks", &f.kaleidoSegments, 2, 16, "%d segments");
     ImGui::Checkbox("Mirror  F3", &f.mirror); ImGui::SameLine(220); ImGui::SetNextItemWidth(-1); ImGui::Combo("##mm", &f.mirrorMode, "Off\0Horizontal\0Vertical\0Quad\0");
@@ -4521,7 +4667,7 @@ void drawModulation() {
             ImGui::TableNextColumn(); ImGui::SetNextItemWidth(-1); changed |= ImGui::Combo("##dst", &r.dst, kModDstNames, DstCount);
             ImGui::TableNextColumn(); ImGui::SetNextItemWidth(-1); changed |= ImGui::SliderFloat("##amt", &r.amount, -1, 1, "%.2f");
             ImGui::TableNextColumn(); ImGui::SetNextItemWidth(-1);
-            if (r.src >= SrcLfoSine) changed |= ImGui::SliderFloat("##rate", &r.rate, 0.25f, 64, "%.2g beats", ImGuiSliderFlags_Logarithmic);
+            if (isLfo(r.src)) changed |= ImGui::SliderFloat("##rate", &r.rate, 0.25f, 64, "%.2g beats", ImGuiSliderFlags_Logarithmic);
             else changed |= ImGui::SliderFloat("##sm", &r.smooth, 0, 0.95f, "smooth %.2f");
             ImGui::TableNextColumn(); ImGui::ProgressBar(std::clamp(r.state, 0.f, 1.f), ImVec2(-1, 8), "");
             ImGui::TableNextColumn();
@@ -5247,6 +5393,20 @@ void buildSelftest() {
         S.safePreset = lib[decks[onAirDeck()].cur].path;
     });
     at(0.5, [] { go(onAirDeck(), 1, true, true); });
+    at(0.5, [] {  // custom shaders: every bundled one must compile
+        scanShaders();
+        int ok = 0;
+        std::string bad;
+        for (auto& u : userShaders) {
+            if (ensureShader(u)) ok++;
+            else bad += " " + u.name + ": " + u.err.substr(0, 120);
+        }
+        testNote("shaders compiled " + std::to_string(ok) + "/" + std::to_string(userShaders.size()) + bad);
+        S.userShader = "kaleido-tunnel";
+        S.userShaderAmount = 1;
+    });
+    at(1.0, [] { pendingShot = "25-shader-kaleido-tunnel"; S.userShader = "edge-neon"; });
+    at(1.0, [] { pendingShot = "26-shader-edge-neon"; S.userShader.clear(); });
     at(0.5, [] {  // stay-in-folder lock
         buildAutoFolders();
         std::string pick;
@@ -5457,6 +5617,7 @@ int main(int argc, char** argv) {
     startAudioFrom(S.audioKind, S.audioDevice, true);
 
     rescan();
+    scanShaders();
     if (selftestDir.empty()) {
         sessionCheckAtStart();
         if (lastRunCrashed && !crashedPreset.empty()) {

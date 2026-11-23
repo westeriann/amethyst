@@ -50,7 +50,8 @@ int main(int argc, char** argv) {
     auto vline = [&](int x, int y0, int y1, int r, int g, int b) { for (int y = y0; y < y1; y++) px(x, y, r, g, b); };
     double lp = 0, bassAcc = 0, allAcc = 0;
     int acc = 0;
-    double lastBpmPrint = -100;
+    double lastBpmPrint = -100, vocalSum = 0;
+    int vocalCols = 0, allCols = 0;
     long long lastBar = -1;
     for (size_t f0 = 0; f0 + blk <= frames; f0 += blk) {
         double t = f0 / 48000.0;
@@ -73,6 +74,9 @@ int main(int argc, char** argv) {
             static const uint8_t col[6][3] = {{40, 40, 40}, {90, 160, 90}, {120, 120, 200}, {60, 110, 250}, {250, 220, 60}, {250, 60, 60}};
             auto c = col[ms.section()];
             vline(x, H - 30, H - 10, c[0], c[1], c[2]);
+            if (ms.vocalsOn()) vline(x, H - 8, H - 2, 80, 230, 200);
+            vocalCols += ms.vocalsOn(), allCols++;
+            vocalSum += ms.vocal();
             // bpm trace (60..200 mapped to rows 10..50)
             px(x, 50 - (int)((bpm - 60) / 140 * 40), 200, 200, 200);
             bassAcc = allAcc = 0;
@@ -99,6 +103,7 @@ int main(int argc, char** argv) {
             printf("%7.2fs  tempo %.1f  conf %.1f  section %s\n", t - 1.0, bpm, tempo.confidence(), MusicStructure::name(ms.section()));
         }
     }
+    printf("VOCALS %.0f%% of the time (avg %.2f)\n", 100.0 * vocalCols / std::max(1, allCols), vocalSum / std::max(1, allCols));
     if (argc > 2) stbi_write_png(argv[2], W, H, 3, img.data(), W * 3);
     return 0;
 }

@@ -1,6 +1,7 @@
 // GPU compositing: deck mixing, post-effects, overlay layers, final pass and projection-mapped
 // presentation (corner pin). All passes are full-screen-triangle shaders on GL 3.3 core.
 #pragma once
+#include <string>
 
 struct RenderTarget {
     unsigned fbo = 0, tex = 0;
@@ -39,8 +40,17 @@ inline const char* blendModeName(int m) {
     return m >= 0 && m < BlendModeCount ? n[m] : "?";
 }
 
+// Inputs for custom (ShaderToy-style) shader effects.
+struct UserFxParams {
+    float time = 0, beat = 0, beatPhase = 0, bass = 0, mid = 0, treble = 0, level = 0, amount = 1, drop = 0, vocal = 0;
+    int frame = 0;
+};
+
 class Gfx {
 public:
+    // Compile a user effect: the file defines mainImage(out vec4, in vec2) like ShaderToy. 0 + err on failure.
+    unsigned compileUser(const std::string& src, std::string& err);
+    void userFx(RenderTarget& out, unsigned prog, unsigned src, unsigned prev, const UserFxParams& p);
     bool init();
     void mix(RenderTarget& out, unsigned a, unsigned b, float x, int mode);
     // Transition from one deck to the other; progress 0..1 (0 = all "from").
