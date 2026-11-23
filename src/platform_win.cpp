@@ -150,3 +150,34 @@ void revealInExplorer(const std::string& path) {
 }
 
 }  // namespace plat
+
+// ---- show safety: crash restart
+namespace {
+bool gRestartArmed = false;
+std::wstring restartCommand() {
+    std::wstring cmd = GetCommandLineW();
+    if (cmd.find(L"--recovered") == std::wstring::npos) cmd += L" --recovered";
+    return cmd;
+}
+LONG WINAPI onCrash(EXCEPTION_POINTERS*) {
+    if (gRestartArmed) plat::restartSelf();
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+}  // namespace
+
+void plat::installCrashRestart(bool armed) {
+    gRestartArmed = armed;
+    SetUnhandledExceptionFilter(onCrash);
+}
+
+void plat::restartSelf() {
+    std::wstring cmd = restartCommand();
+    STARTUPINFOW si{};
+    si.cb = sizeof si;
+    PROCESS_INFORMATION pi{};
+    if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+    TerminateProcess(GetCurrentProcess(), 3);
+}

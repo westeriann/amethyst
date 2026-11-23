@@ -72,6 +72,10 @@ struct Settings {
     bool autoOn = false, shuffle = true, autoDecks = false, smartMix = true, fakeoutRecut = true, autoFx = true, autoFxFlash = true;
     float autoFxAmount = 0.7f;   // how hard Auto FX pushes the effects
     float buildTease = 0.35f;    // how far the drop preset fades in during a build-up (0 = off)
+    bool smartBlends = true;     // drops smash both presets together with a layer blend
+    bool watchdog = true;        // show safety: skip presets that go black, freeze or crawl
+    std::string safePreset;      // fallback preset for the watchdog and the panic button
+    std::string autoFolder;      // auto-pilot only picks presets inside this folder (empty = anywhere)
     int quantize = 2;            // auto-pilot launch grid
     bool quantizeManual = false; // also quantize manual launches
     float gain = 1, speed = 1;
@@ -133,7 +137,7 @@ struct Field { const char* key; char type; void* p; };
 std::vector<Field> fields() {
     return {
         {"blend", 'f', &S.blend}, {"interval", 'i', &S.interval}, {"auto", 'b', &S.autoOn}, {"shuffle", 'b', &S.shuffle},
-        {"auto_decks", 'b', &S.autoDecks}, {"smart_mix", 'b', &S.smartMix}, {"fakeout_recut", 'b', &S.fakeoutRecut}, {"auto_fx", 'b', &S.autoFx}, {"auto_fx_flash", 'b', &S.autoFxFlash}, {"auto_fx_amount", 'f', &S.autoFxAmount}, {"build_tease", 'f', &S.buildTease}, {"quantize", 'i', &S.quantize}, {"quantize_manual", 'b', &S.quantizeManual},
+        {"auto_decks", 'b', &S.autoDecks}, {"smart_mix", 'b', &S.smartMix}, {"fakeout_recut", 'b', &S.fakeoutRecut}, {"auto_fx", 'b', &S.autoFx}, {"auto_fx_flash", 'b', &S.autoFxFlash}, {"auto_fx_amount", 'f', &S.autoFxAmount}, {"build_tease", 'f', &S.buildTease}, {"smart_blends", 'b', &S.smartBlends}, {"watchdog", 'b', &S.watchdog}, {"safe_preset", 's', &S.safePreset}, {"auto_folder", 's', &S.autoFolder}, {"quantize", 'i', &S.quantize}, {"quantize_manual", 'b', &S.quantizeManual},
         {"gain", 'f', &S.gain}, {"speed", 'f', &S.speed}, {"quality", 'i', &S.quality}, {"xfade", 'f', &S.xfade}, {"mix_mode", 'i', &S.mixMode},
         {"show_menu", 'b', &S.showMenu}, {"show_browser", 'b', &S.showBrowser}, {"show_hud", 'b', &S.showHud}, {"show_cues", 'b', &S.showCues},
         {"show_toasts", 'b', &S.showToasts}, {"show_status", 'b', &S.showStatus}, {"show_mixer", 'b', &S.showMixer}, {"show_fx", 'b', &S.showFx},
@@ -228,9 +232,11 @@ struct Deck {
     int pendingIdx = -1, pendingToken = 0, pendingDir = 1, failStreak = 0;
     bool pendingHard = false, pendingRecord = true, pendingAdvance = false, pendingRandom = false, pendingEditor = false;
     bool pendingHold = false;       // keep the loaded preset ready on the spare until releaseHeld()
+    bool pendingAuto = false;       // the load was picked by auto-pilot (retries stay in its folder)
     int heldIdx = -1;               // preset waiting on the spare player
     double pendingBlendSecs = -1;   // blend override for this load (-1 = normal)
     float blendManual = -1;         // >= 0: hold the blend at this amount (build-up tease), else time-based
+    int blendMode = 0;              // MixCrossfade, or a layer mode (Add, Screen...) for drop smashes and teases
     std::vector<std::string> hist;
     double time = 0, lastSwitch = 0;
     PresetPlayer& visible() { return players[active]; }
@@ -295,6 +301,8 @@ bool keyboardOpen = false;
 float bandBass = 0, bandMid = 0, bandTreb = 0, bandLevel = 0;
 float peakBass = 0.05f, peakMid = 0.05f, peakTreb = 0.05f, peakLevel = 0.05f;
 double transitionSeconds();
+double beatsToSec(double beats);
+void panicSafe();
 void startXfade(float to, double dur);
 MusicStructure structure;
 int xfadeOnLoad = -1;  // A/B auto-mix: crossfade to this deck once its preset has compiled
@@ -542,6 +550,7 @@ bool inPool(int i) {
     return true;
 }
 
+void rebuildAutoView();
 void rebuildView() {
     std::vector<std::string> terms;
     std::istringstream ss(lower(query));
@@ -564,6 +573,7 @@ void rebuildView() {
         if (S.pool.rfind("similar:", 0) == 0) sortSimilar(view);
     }
     upcoming = -1;  // picked from the old filters: auto-pilot must stay inside the new ones
+    rebuildAutoView();
     int cur = decks[focus].cur;
     auto it = std::find(view.begin(), view.end(), cur);
     sel = it == view.end() ? 0 : (int)(it - view.begin());
@@ -656,7 +666,34 @@ void markBroken(int idx, const std::string& why) {
 Meta& metaOf(int idx) { return meta[lib[idx].path]; }
 
 // ===================================================================== decks & navigation
+// Auto-pilot picks from the browser's filtered list, narrowed to the "stay in folder" lock. If the
+// filters and the folder have nothing in common, the folder wins.
+bool autoPicking = false;
+std::vector<int> autoView;
+bool inAutoFolder(int i) {
+    if (S.autoFolder.empty()) return true;
+    const std::string& p = lib[i].path;
+    return p.size() > S.autoFolder.size() && p.compare(0, S.autoFolder.size(), S.autoFolder) == 0 &&
+           (p[S.autoFolder.size()] == '\\' || p[S.autoFolder.size()] == '/');
+}
+void rebuildAutoView() {
+    autoView.clear();
+    if (S.autoFolder.empty()) return;
+    for (int i : view)
+        if (inAutoFolder(i)) autoView.push_back(i);
+    if (autoView.empty())
+        for (int i = 0; i < (int)lib.size(); i++)
+            if (inAutoFolder(i)) autoView.push_back(i);
+}
+const std::vector<int>& pickPool() { return autoPicking && !S.autoFolder.empty() && !autoView.empty() ? autoView : view; }
+struct AutoPickScope {  // marks a pick as made by auto-pilot
+    bool old;
+    AutoPickScope(bool on = true) : old(autoPicking) { autoPicking = autoPicking || on; }
+    ~AutoPickScope() { autoPicking = old; }
+};
+
 int stepFrom(int base, int dir) {
+    const auto& view = pickPool();
     if (view.empty()) return -1;
     auto it = std::find(view.begin(), view.end(), base);
     int i = it == view.end() ? (dir > 0 ? -1 : (int)view.size()) : (int)(it - view.begin());
@@ -668,6 +705,7 @@ int stepFrom(int base, int dir) {
 }
 
 int pickRandom(int exclude) {
+    const auto& view = pickPool();
     if (view.empty()) return -1;
     std::uniform_int_distribution<size_t> d(0, view.size() - 1);
     for (int n = 0; n < 24; n++) {
@@ -677,6 +715,7 @@ int pickRandom(int exclude) {
     return stepFrom(exclude, 1);
 }
 
+void sessionMark(const std::string& loading);
 // Queue a preset on the deck's spare player. Never blocks: the switch happens in commitLoads()
 // once the preset has compiled and rendered its first frames.
 bool loadPreset(int d, int idx, bool hard, bool record = true) {
@@ -693,6 +732,7 @@ bool loadPreset(int d, int idx, bool hard, bool record = true) {
     dk.heldIdx = -1;
     dk.pendingBlendSecs = -1;
     dk.spare().load(lib[idx].path, dk.pendingToken);
+    sessionMark(lib[idx].path);
     if (d == focus) {
         auto it = std::find(view.begin(), view.end(), idx);
         if (it != view.end()) { sel = (int)(it - view.begin()); scrollToSel = true; }
@@ -706,7 +746,8 @@ void go(int d, int dir, bool hard, bool random = false) {
     if (view.empty()) { toast(true, query.empty() ? "No presets in this pool — add a folder (Ctrl+Shift+O)" : "No presets match the search"); return; }
     int target;
     if (random) {
-        bool upOk = upcoming >= 0 && upcoming != decks[d].cur && !lib[upcoming].broken && std::find(view.begin(), view.end(), upcoming) != view.end();
+        const auto& pool = pickPool();
+        bool upOk = upcoming >= 0 && upcoming != decks[d].cur && !lib[upcoming].broken && std::find(pool.begin(), pool.end(), upcoming) != pool.end();
         target = upOk ? upcoming : pickRandom(navBase(d));
         upcoming = -1;
     } else {
@@ -717,10 +758,16 @@ void go(int d, int dir, bool hard, bool random = false) {
     decks[d].pendingAdvance = true;  // if it fails to load, try the next one
     decks[d].pendingDir = dir;
     decks[d].pendingRandom = random;
+    decks[d].pendingAuto = autoPicking;
 }
 
+void sessionMark(const std::string& loading);
 // Called every frame: finish loads that the player threads completed.
 void commitLoads() {
+    static bool wasLoading = false;
+    bool loadingNow = decks[0].pendingIdx >= 0 || decks[1].pendingIdx >= 0;
+    if (wasLoading && !loadingNow) sessionMark("");
+    wasLoading = loadingNow;
     for (int d = 0; d < 2; d++) {
         Deck& dk = decks[d];
         PresetPlayer::LoadResult r;
@@ -739,7 +786,10 @@ void commitLoads() {
                     markBroken(idx, r.error);
                     toast(true, "Skipped \"%s\" — %s", lib[idx].name.c_str(), r.error.c_str());
                 }
-                if (dk.pendingAdvance && ++dk.failStreak < 12) go(d, dk.pendingDir, dk.pendingHard, dk.pendingRandom);
+                if (dk.pendingAdvance && ++dk.failStreak < 12) {
+                    AutoPickScope scope(dk.pendingAuto);
+                    go(d, dk.pendingDir, dk.pendingHard, dk.pendingRandom);
+                }
                 continue;
             }
             dk.failStreak = 0;
@@ -760,6 +810,7 @@ void commitLoads() {
             dk.blending = !dk.pendingHard && bd > 0.01;
             dk.blendStart = now();
             dk.blendDur = bd;
+            dk.blendMode = MixCrossfade;
             if (xfadeOnLoad == d) {
                 startXfade(d ? 1.f : 0.f, xfadeOnLoadSecs);
                 xfadeOnLoad = -1;
@@ -786,6 +837,7 @@ double beatNow() { return tempo.beatAt(now()); }
 
 // Launch now, or at the next beat/bar boundary when quantizing.
 void requestLaunch(int d, int idx, int dir, bool hard, bool random, bool fromAuto) {
+    AutoPickScope scope(fromAuto);
     int q = S.quantize;
     bool quantized = q > 0 && (fromAuto || S.quantizeManual) && !hard;
     if (!quantized) {
@@ -806,6 +858,7 @@ void startXfade(float to, double dur) {
 }
 
 void autoAdvance() {
+    AutoPickScope scope;
     if (S.autoDecks) {
         int off = S.xfade < 0.5f ? 1 : 0;
         int target = S.shuffle ? pickRandom(decks[off].cur) : stepFrom(decks[1 - off].cur, 1);
@@ -1853,6 +1906,7 @@ struct Smart {
     double lastSwitch = 0;
     bool afterFake = false;  // between a fakeout and the real drop
     bool peeking = false;    // the drop preset is already faded in a little (build-up tease)
+    int energy = 0;          // energy class of the prepared preset
     std::string lastEvent;
     double lastEventAt = -100;
 } smart;
@@ -1860,10 +1914,11 @@ struct Smart {
 int onAirDeck() { return S.xfade < 0.5f ? 0 : 1; }
 
 int smartPick(int energy) {
+    AutoPickScope scope;
     int on = onAirDeck();
     if (energy == 0) return S.shuffle ? pickRandom(decks[on].cur) : stepFrom(decks[on].cur, 1);
     std::vector<int> c;
-    for (int i : view) {
+    for (int i : pickPool()) {
         if (lib[i].broken || i == decks[0].cur || i == decks[1].cur) continue;
         auto it = looks.find(lib[i].path);
         if (it == looks.end()) continue;
@@ -1889,6 +1944,7 @@ bool releaseHeld(int d, double blendSecs) {
     dk.blending = blendSecs > 0.01;
     dk.blendStart = now();
     dk.blendDur = blendSecs;
+    dk.blendMode = MixCrossfade;
     return true;
 }
 
@@ -1902,7 +1958,7 @@ void smartCancel() {
         if (S.autoDecks) startXfade(smart.deck ? 1.f : 0.f, 2.0);
         else {
             Deck& dk = decks[smart.deck];
-            dk.blendStart = now() - std::max(0.f, dk.blendManual) * 2.0, dk.blendDur = 2.0, dk.blendManual = -1;
+            dk.blendStart = now() - std::max(0.f, dk.blendManual) * 2.0, dk.blendDur = 2.0, dk.blendManual = -1, dk.blendMode = MixCrossfade;
         }
     }
     smart.peeking = false;
@@ -1928,9 +1984,13 @@ bool smartPrepare(int energy, int fireOn, double fireBeat, double blend, bool ha
     if (!S.autoDecks) decks[d].pendingHold = true;
     smart.prep = true;
     smart.deck = d, smart.idx = idx, smart.fireOn = fireOn, smart.fireBeat = fireBeat, smart.blend = blend, smart.hard = hard;
+    smart.energy = energy;
     return true;
 }
-void smartPeek(float k) {  // fade the waiting drop preset in a little
+const int smashModes[] = {MixAdd, MixScreen, MixDifference, MixLighten};
+int smashMode = -1;
+double smashUntil = 0;
+void smartPeek(float k) {  // glow the waiting drop preset in a little
     if (!smart.prep || !smartReady()) return;
     if (S.autoDecks) {
         S.xfade = smart.deck ? k : 1 - k;
@@ -1939,20 +1999,37 @@ void smartPeek(float k) {  // fade the waiting drop preset in a little
         if (!smart.peeking) {
             releaseHeld(smart.deck, 0);
             dk.blending = true;
+            dk.blendMode = S.smartBlends ? MixScreen : MixCrossfade;
         }
         dk.blendManual = k;
     }
     smart.peeking = true;
 }
 void smartFire(double t) {
-    if (S.autoDecks) startXfade(smart.deck ? 1.f : 0.f, smart.hard ? 0.04 : smart.blend);
-    else if (smart.peeking) {
+    // drops: smash the two presets together with a layer blend for a bar instead of a plain cut
+    bool smash = smart.hard && autoFxOn() && S.smartBlends && smart.energy > 0;
+    int mode = smashModes[rng() % 4];
+    if (S.autoDecks) {
+        if (smash) {
+            S.xfade = 0.5f;  // both decks full
+            smashMode = mode, smashUntil = t + beatsToSec(4);
+            startXfade(smart.deck ? 1.f : 0.f, beatsToSec(4));
+        } else {
+            startXfade(smart.deck ? 1.f : 0.f, smart.hard ? 0.04 : smart.blend);
+        }
+    } else {
         Deck& dk = decks[smart.deck];
-        float k = std::max(0.f, dk.blendManual);
-        dk.blendManual = -1;
-        if (smart.hard) dk.blending = false;
-        else dk.blendStart = now() - k * smart.blend, dk.blendDur = smart.blend;
-    } else releaseHeld(smart.deck, smart.hard ? 0 : smart.blend);
+        if (smart.peeking) {
+            float k = std::max(0.f, dk.blendManual);
+            dk.blendManual = -1;
+            if (smash) dk.blending = true, dk.blendStart = now(), dk.blendDur = beatsToSec(4), dk.blendMode = mode;
+            else if (smart.hard) dk.blending = false, dk.blendMode = MixCrossfade;
+            else dk.blendStart = now() - k * smart.blend, dk.blendDur = smart.blend, dk.blendMode = MixCrossfade;
+        } else {
+            releaseHeld(smart.deck, smash ? beatsToSec(4) : smart.hard ? 0 : smart.blend);
+            if (smash) dk.blendMode = mode;
+        }
+    }
     smart.peeking = false;
     smart.prep = false;
     smart.lastSwitch = t;
@@ -2174,7 +2251,7 @@ void renderFrame(double t, double dt) {
     applyModulation(beatNow());
     autoFxApply(t, dt);
     // Deck B is only rendered when it can be seen.
-    bool needB = modOut.xfade > 0.001f || S.mixMode != MixCrossfade || S.showMixer || xanim.active;
+    bool needB = modOut.xfade > 0.001f || S.mixMode != MixCrossfade || S.showMixer || xanim.active || smart.peeking;
     for (auto& o : outputs) needB |= o.source == 2;
     for (int d = 0; d < 2; d++) {
         if (d == 1 && !needB) continue;
@@ -2190,10 +2267,12 @@ void renderFrame(double t, double dt) {
             float k = dk.blendManual >= 0 ? dk.blendManual : (float)std::clamp((t - dk.blendStart) / std::max(0.01, dk.blendDur), 0.0, 1.0);
             float e = dk.blendManual >= 0 ? k : k * k * k * (k * (k * 6 - 15) + 10);  // smootherstep: gentle in, gentle out
             dk.rt.ensure(w, h);
-            if (autoFxOn() && afx.transition > 0) gfx.transition(dk.rt, dk.spare().texture(), cur, e, afx.transition, (float)t);
+            if (dk.blendMode != MixCrossfade)  // both layers full, then the old one melts away (tease: new one glows in)
+                gfx.mix(dk.rt, dk.spare().texture(), cur, dk.blendManual >= 0 ? k * 0.7f : 0.5f + 0.5f * e, dk.blendMode);
+            else if (autoFxOn() && afx.transition > 0) gfx.transition(dk.rt, dk.spare().texture(), cur, e, afx.transition, (float)t);
             else gfx.mix(dk.rt, dk.spare().texture(), cur, e, MixCrossfade);
             dk.outTex = dk.rt.tex;
-            if (dk.blendManual < 0 && k >= 1) dk.blending = false;
+            if (dk.blendManual < 0 && k >= 1) dk.blending = false, dk.blendMode = MixCrossfade;
         } else {
             dk.outTex = cur;
         }
@@ -2207,7 +2286,10 @@ void renderFrame(double t, double dt) {
         float p = toB ? S.xfade : 1 - S.xfade;
         gfx.transition(mixRT, decks[toB ? 0 : 1].outTex, decks[toB ? 1 : 0].outTex, std::clamp(p, 0.f, 1.f), trans, (float)t);
     } else {
-        gfx.mix(mixRT, decks[0].outTex, needB ? decks[1].outTex : decks[0].outTex, needB ? modOut.xfade : 0.f, S.mixMode);
+        int mm = S.mixMode;
+        if (smashMode >= 0 && t < smashUntil) mm = smashMode;
+        else if (smart.peeking && S.autoDecks) mm = MixScreen;
+        gfx.mix(mixRT, decks[0].outTex, needB ? decks[1].outTex : decks[0].outTex, needB ? modOut.xfade : 0.f, mm);
     }
     fxRotation += (float)(S.fx.rotateSpeed * dt);
     int prev = fxIdx;
@@ -2300,6 +2382,8 @@ void registerActions() {
 
     toggle("blackout", "Blackout", "Performance", &blackoutOn);
     trig("flash", "Flash", "Performance", [] { flashAmt = 1; });
+    trig("safe_now", "Safe preset now (panic)", "Performance", [] { panicSafe(); });
+    toggle("watchdog", "Show safety watchdog", "Performance", &S.watchdog);
     { Action a; a.id = "freeze"; a.label = "Freeze (hold)"; a.group = "Performance"; a.kind = Action::Momentary;
       a.set = [](float v) { frozen = v > 0.5f; }; a.get = [] { return frozen ? 1.f : 0.f; }; actions.add(a); }
     cont("speed", "Speed", "Performance", [](float v) { S.speed = logDenorm(v, 0.1f, 4.f); }, [] { return logNorm(S.speed, 0.1f, 4.f); });
@@ -2919,6 +3003,115 @@ std::string stars(int n) {
     return s;
 }
 
+bool autoMenuTestOpen = false;
+// Right-click menu on the AUTO button: every auto-pilot setting in one place.
+std::vector<std::pair<std::string, std::string>> autoFolders;  // label, absolute path
+size_t autoFoldersFor = (size_t)-1;
+void buildAutoFolders() {
+    autoFoldersFor = lib.size();
+    std::map<std::string, std::string> dirs;  // path -> label
+    for (auto& root : S.folders) {
+        fs::path r = fs::u8path(root);
+        std::string rootLabel = r.filename().u8string();
+        if (rootLabel.empty()) rootLabel = root;
+        for (auto& p : lib) {
+            if (p.path.compare(0, root.size(), root) != 0) continue;
+            fs::path d = fs::u8path(p.path).parent_path();
+            while (d.u8string().size() >= root.size()) {
+                std::string ds = d.u8string();
+                if (dirs.count(ds)) break;
+                std::string rel = ds.size() > root.size() ? ds.substr(root.size() + 1) : "";
+                for (auto& c : rel) if (c == '\\') c = '/';
+                dirs[ds] = rel.empty() ? rootLabel : rootLabel + "/" + rel;
+                if (ds.size() == root.size()) break;
+                d = d.parent_path();
+            }
+        }
+    }
+    autoFolders.clear();
+    for (auto& [path, label] : dirs) autoFolders.push_back({label, path});
+    std::sort(autoFolders.begin(), autoFolders.end());
+}
+std::string autoFolderLabel() {
+    for (auto& f : autoFolders) if (f.second == S.autoFolder) return f.first;
+    return fs::u8path(S.autoFolder).filename().u8string();
+}
+void setAutoFolder(const std::string& path) {
+    S.autoFolder = path;
+    rebuildAutoView();
+    upcoming = -1;
+    saveSettings();
+    if (path.empty()) toast(false, "Auto-pilot: any folder");
+    else toast(false, "Auto-pilot stays in %s (%d presets)", autoFolderLabel().c_str(), (int)autoView.size());
+}
+
+void drawAutoMenu() {
+    if (autoFoldersFor != lib.size()) buildAutoFolders();
+    ImGui::TextColored(kAccent2, "Auto-pilot");
+    if (ImGui::Checkbox("On", &S.autoOn)) decks[0].lastSwitch = decks[1].lastSwitch = now();
+    ImGui::SameLine();
+    ImGui::TextDisabled("(A)");
+    ImGui::SeparatorText("Presets");
+    {   // stay in folder
+        static char filt[64] = "";
+        std::string cur = S.autoFolder.empty() ? "Any folder" : autoFolderLabel();
+        ImGui::SetNextItemWidth(260);
+        if (ImGui::BeginCombo("Stay in folder", cur.c_str(), ImGuiComboFlags_HeightLarge)) {
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+            ImGui::InputTextWithHint("##ff", "filter folders...", filt, sizeof filt);
+            if (ImGui::Selectable("Any folder", S.autoFolder.empty())) setAutoFolder("");
+            std::string f = lower(filt);
+            for (auto& [label, path] : autoFolders) {
+                if (!f.empty() && lower(label).find(f) == std::string::npos) continue;
+                if (ImGui::Selectable(label.c_str(), S.autoFolder == path)) setAutoFolder(path);
+            }
+            ImGui::EndCombo();
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Auto-pilot only picks presets from this folder (and its subfolders).\nThe browser filters (pool, folder, search) still narrow it further.");
+        if (!S.autoFolder.empty()) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("x")) setAutoFolder("");
+            ImGui::TextDisabled("%d presets to pick from", (int)autoView.size());
+        }
+    }
+    ImGui::Checkbox("Shuffle", &S.shuffle);
+    ImGui::SameLine();
+    ImGui::TextDisabled(S.shuffle ? "random order" : "in list order");
+    ImGui::Checkbox("Mix decks A/B", &S.autoDecks);
+    ImGui::SetNextItemWidth(160);
+    ImGui::SliderInt("Change every (s)", &S.interval, 4, 300);
+    ImGui::SeparatorText("Following the song");
+    ImGui::Checkbox("Smart mode (switch on phrases and drops)", &S.smartMix);
+    ImGui::BeginDisabled(!S.smartMix);
+    ImGui::Checkbox("New preset on the real drop after a fakeout", &S.fakeoutRecut);
+    ImGui::Checkbox("Smart blend modes on drops", &S.smartBlends);
+    ImGui::SetNextItemWidth(160);
+    ImGui::SliderFloat("Build-up tease", &S.buildTease, 0.f, 0.6f, "%.2f");
+    ImGui::EndDisabled();
+    if (!S.smartMix) {
+        ImGui::SetNextItemWidth(160);
+        ImGui::Combo("Launch on", &S.quantize, kQuantizeNames, 4);
+    }
+    ImGui::SeparatorText("Auto FX");
+    ImGui::Checkbox("Effects follow the song", &S.autoFx);
+    ImGui::BeginDisabled(!S.autoFx);
+    ImGui::SetNextItemWidth(160);
+    ImGui::SliderFloat("Strength", &S.autoFxAmount, 0.f, 1.f, "%.2f");
+    ImGui::Checkbox("Flashes & strobes", &S.autoFxFlash);
+    ImGui::EndDisabled();
+    ImGui::SeparatorText("Safety");
+    ImGui::Checkbox("Show safety watchdog", &S.watchdog);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Skips presets that go black, freeze or run too slowly while music plays.");
+    {
+        auto it = byPath.find(S.safePreset);
+        ImGui::TextDisabled("Safe preset: %s", it != byPath.end() ? lib[it->second].name.c_str() : "(automatic)");
+    }
+    if (ImGui::Button("Safe preset now")) panicSafe();
+    ImGui::SameLine();
+    ImGui::TextDisabled("right-click a preset to choose it");
+}
+
 void presetContextMenu(int idx) {
     Preset& p = lib[idx];
     Meta& m = meta[p.path];
@@ -2927,6 +3120,11 @@ void presetContextMenu(int idx) {
     if (ImGui::MenuItem("Load to deck B")) loadPreset(1, idx, false);
     ImGui::Separator();
     if (ImGui::MenuItem("Favorite", "Ctrl+D", m.fav)) { m.fav = !m.fav; saveLibrary(); }
+    if (ImGui::MenuItem("Use as safe preset", nullptr, S.safePreset == p.path)) {
+        S.safePreset = p.path;
+        saveSettings();
+        toast(false, "Safe preset: %s (used by show safety and the panic button)", p.name.c_str());
+    }
     if (ImGui::BeginMenu("Rating")) {
         for (int r = 0; r <= 5; r++)
             if (ImGui::MenuItem(r ? stars(r).c_str() : "No rating", nullptr, m.rating == r)) { m.rating = r; saveLibrary(); }
@@ -3328,11 +3526,17 @@ void drawHud(float y, float h) {
     double left = std::max(0.0, S.interval - since);
     double hb = beatNow();
     if (S.autoOn && S.smartMix)
-        snprintf(b, sizeof b, "AUTO smart  %s  bar %d/8%s%s%s", MusicStructure::name(structure.section()), structure.barInPhrase(hb) + 1,
-                 S.autoFx ? " +FX" : "", S.autoDecks ? ", A/B mix" : "", keyHint("auto").c_str());
+        snprintf(b, sizeof b, "AUTO smart  %s  bar %d/8%s%s%s%s", MusicStructure::name(structure.section()), structure.barInPhrase(hb) + 1,
+                 S.autoFx ? " +FX" : "", S.autoDecks ? ", A/B mix" : "", S.autoFolder.empty() ? "" : ("  in " + fs::u8path(S.autoFolder).filename().u8string()).c_str(),
+                 keyHint("auto").c_str());
     else if (S.autoOn) snprintf(b, sizeof b, "AUTO %s  %s%s%s", locked ? "--" : (std::to_string((int)std::ceil(left)) + "s").c_str(), S.shuffle ? "shuffle" : "in order", S.autoDecks ? ", A/B mix" : "", keyHint("auto").c_str());
     else snprintf(b, sizeof b, "AUTO off%s", keyHint("auto").c_str());
-    pill(b, kAccent2, S.autoOn, "Auto-pilot (A). Interval , .  Shuffle S.  Quantize K", [] { actions.invoke("auto", true); });
+    pill(b, kAccent2, S.autoOn, "Auto-pilot (A). Right-click for options: folder, smart mode, Auto FX...", [] { actions.invoke("auto", true); });
+    if (ImGui::IsItemClicked(ImGuiMouseButton_Right) || autoMenuTestOpen) ImGui::OpenPopup("##automenu"), autoMenuTestOpen = false;
+    if (ImGui::BeginPopup("##automenu")) {
+        drawAutoMenu();
+        ImGui::EndPopup();
+    }
     if (locked) pill(("LOCKED" + keyHint("lock")).c_str(), kWarn, true, nullptr, [] { locked = false; });
     snprintf(b, sizeof b, "QUANTIZE %s%s", kQuantizeNames[S.quantize], keyHint("quantize").c_str()); pill(b, kAccent, S.quantize > 0, "Launches wait for the next beat/bar", [] { actions.invoke("quantize", true); });
     snprintf(b, sizeof b, "BLEND %.2gs [ ]", S.blend); pill(b, kAccent, false, "Blend time");
@@ -3412,6 +3616,10 @@ void drawMixer() {
         ImGui::SliderFloat("Build-up tease", &S.buildTease, 0.f, 0.6f, "%.2f");
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("During a build-up the drop preset slowly fades in up to this much,\nthen snaps to full on the drop. 0 = off.");
+        ImGui::Checkbox("Smart blend modes", &S.smartBlends);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("With Auto FX: on a drop both presets slam together for a bar (add, screen, difference or\n"
+                              "lighten) before the old one melts away, and build-up teases glow in instead of fading.");
         ImGui::Checkbox("Auto FX: effects follow the song", &S.autoFx);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("While auto-pilot runs: flash, zoom punch and strobe on drops, risers in build-ups,\n"
@@ -4465,6 +4673,135 @@ void drawUi() {
 
 // ===================================================================== self-test
 std::string selftestDir;
+bool wdTestMode = false, recoveredStart = false;
+int wdBefore = -1;
+// ===================================================================== show safety
+// A watchdog samples the output twice a second (async readback, no stall). If music is playing but
+// the picture has gone black or stopped moving for 8 s, the preset is skipped for the safe preset;
+// if that does not help, the app restarts itself. Presets that drag the frame rate down get skipped.
+// A session file remembers what was loading, so a preset that crashed the app is marked broken.
+std::string sessionPath() { return plat::appDataDir() + "\\session.txt"; }
+std::string crashedPreset;  // set at startup when the last session ended in a crash
+bool lastRunCrashed = false;
+void sessionMark(const std::string& loading) {
+    if (!selftestDir.empty()) return;
+    std::ofstream f(fs::u8path(sessionPath()), std::ios::trunc);
+    f << "running\n" << loading << "\n";
+}
+void sessionCheckAtStart() {
+    std::ifstream f(fs::u8path(sessionPath()));
+    std::string a;
+    if (!std::getline(f, a)) return;
+    lastRunCrashed = true;
+    std::getline(f, crashedPreset);
+}
+
+int safeIndex(int avoid) {
+    auto it = byPath.find(S.safePreset);
+    if (it != byPath.end() && !lib[it->second].broken && it->second != avoid) return it->second;
+    for (int i : view)  // otherwise the first healthy preset in the bundled folder or the list
+        if (!lib[i].broken && i != avoid && lib[i].path.find(plat::exeDir()) == 0) return i;
+    return pickRandom(avoid);
+}
+void goSafe(int d, const char* why, bool markBad) {
+    int cur = decks[d].cur;
+    if (markBad && cur >= 0) markBroken(cur, why);
+    int idx = safeIndex(cur);
+    if (idx >= 0) loadPreset(d, idx, true);
+    if (smart.prep) smartCancel();
+    if (cur >= 0) toast(true, "Show safety: \"%s\" %s, switched to a safe preset", lib[cur].name.c_str(), why);
+}
+void panicSafe() {  // the panic button: safe preset on air, effects reset, no flashes or blackout
+    S.fx = FxParams{};
+    flashAmt = 0, blackoutOn = false, frozen = false;
+    afx = AutoFx{};
+    for (int d = 0; d < 2; d++) decks[d].blending = false, decks[d].blendManual = -1;
+    goSafe(onAirDeck(), "was replaced by the panic button", false);
+}
+
+struct Watchdog {
+    RenderTarget rt;
+    unsigned pbo[2] = {0, 0};
+    int idx = 0;
+    bool primed = false;
+    double lastSample = 0, darkSince = -1, stillSince = -1, fallbackAt = -100, slowSince = -1;
+    std::vector<float> prev;
+    float dtAvg = 0.016f;
+    std::unordered_map<std::string, int> slowStrikes;
+} wd;
+
+void watchdogTick(double t, double dt) {
+    wd.dtAvg += ((float)dt - wd.dtAvg) * 0.05f;
+    if (!S.watchdog || !selftestDir.empty() && !wdTestMode) return;
+    int on = onAirDeck();
+    Deck& dk = decks[on];
+    bool loading = anyLoading() || dk.blending || xanim.active;
+    // too heavy: under ~14 fps for 4 s with nothing else going on
+    if (wd.dtAvg > 0.07f && !loading && t - dk.lastSwitch > 4) {
+        if (wd.slowSince < 0) wd.slowSince = t;
+        if (t - wd.slowSince > 4 && dk.cur >= 0) {
+            wd.slowSince = -1;
+            int strikes = ++wd.slowStrikes[lib[dk.cur].path];
+            toast(true, "Show safety: \"%s\" is too heavy for this computer, skipping it", lib[dk.cur].name.c_str());
+            if (strikes >= 2) markBroken(dk.cur, "too slow");
+            go(on, 1, true, true);
+        }
+    } else {
+        wd.slowSince = -1;
+    }
+    // output sample, twice a second
+    if (t - wd.lastSample < 0.5) return;
+    wd.lastSample = t;
+    const int W = 32, H = 18;
+    if (!wd.pbo[0]) glGenBuffers(2, wd.pbo);
+    wd.rt.ensure(W, H);
+    glBindFramebuffer(GL_FRAMEBUFFER, wd.rt.fbo);
+    glViewport(0, 0, W, H);
+    gfx.present(finalRT.tex, 0, 0, W, H, nullptr, false);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, wd.pbo[wd.idx]);
+    glBufferData(GL_PIXEL_PACK_BUFFER, W * H * 4, nullptr, GL_STREAM_READ);
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    glReadPixels(0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    std::vector<float> lum;
+    if (wd.primed) {
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, wd.pbo[1 - wd.idx]);
+        if (auto* p = (const unsigned char*)glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, W * H * 4, GL_MAP_READ_BIT)) {
+            lum.resize(W * H);
+            for (int i = 0; i < W * H; i++) lum[i] = (p[i * 4] + p[i * 4 + 1] + p[i * 4 + 2]) / 765.f;
+            glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+        }
+    }
+    wd.primed = true;
+    wd.idx = 1 - wd.idx;
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    if (lum.empty()) return;
+    double mean = 0, diff = 0;
+    for (size_t i = 0; i < lum.size(); i++) {
+        mean += lum[i];
+        if (wd.prev.size() == lum.size()) diff += std::fabs(lum[i] - wd.prev[i]);
+    }
+    mean /= lum.size(), diff /= lum.size();
+    wd.prev = lum;
+    // only judge while music plays and nothing dims or holds the picture on purpose
+    bool expectLife = (level > 0.01f || wdTestMode) && !blackoutOn && blackAmt < 0.05f && afx.black < 0.2f && !frozen && S.speed > 0.05f &&
+                      structure.section() != MusicStructure::Silence && !loading;
+    if (!expectLife) { wd.darkSince = wd.stillSince = -1; return; }
+    if (mean < 0.015) { if (wd.darkSince < 0) wd.darkSince = t; } else wd.darkSince = -1;
+    if (diff < 0.0015) { if (wd.stillSince < 0) wd.stillSince = t; } else wd.stillSince = -1;
+    bool dark = wd.darkSince >= 0 && t - wd.darkSince > 8, still = wd.stillSince >= 0 && t - wd.stillSince > 8;
+    if (!dark && !still) return;
+    wd.darkSince = wd.stillSince = -1;
+    if (t - wd.fallbackAt < 20 && still) {  // the safe preset did not help: the GPU or a player is stuck
+        toast(true, "Show safety: output is stuck, restarting Amethyst");
+        saveSettings();
+        plat::restartSelf();
+        return;
+    }
+    wd.fallbackAt = t;
+    goSafe(on, dark ? "went black" : "froze", true);
+}
+
 
 void writePng(const std::string& path, int w, int h, std::vector<unsigned char>& rgba) {
     static uint32_t crcTab[256];
@@ -4892,8 +5229,53 @@ void buildSelftest() {
         std::sort(p.begin(), p.end());
         auto q = [&](float f) { return p.empty() ? -1.f : p[std::min(p.size() - 1, (size_t)(f * p.size()))]; };
         for (auto& [k, l] : looks) n += energyClass(l) > 0;
+        wdTestMode = true;
+        S.watchdog = true;
+        structure.debugPin(MusicStructure::Groove, beatNow());
+        wdBefore = decks[onAirDeck()].cur;
+        S.fx.brightness = -1;  // force the picture to black
         testNote("punch measured=" + std::to_string(p.size()) + " p10=" + std::to_string(q(0.1f)) + " p50=" + std::to_string(q(0.5f)) +
                  " p90=" + std::to_string(q(0.9f)) + " intense=" + std::to_string(n));
+    });
+    at(10.0, [] {
+        int now_ = decks[onAirDeck()].cur;
+        testNote("watchdog: before=" + std::to_string(wdBefore) + " after=" + std::to_string(now_) +
+                 " before broken=" + std::to_string(wdBefore >= 0 && lib[wdBefore].broken));
+        S.fx = FxParams{};
+        wdTestMode = false;
+        structure.debugPin(MusicStructure::Silence, beatNow(), false);
+        S.safePreset = lib[decks[onAirDeck()].cur].path;
+    });
+    at(0.5, [] { go(onAirDeck(), 1, true, true); });
+    at(0.5, [] {  // stay-in-folder lock
+        buildAutoFolders();
+        std::string pick;
+        for (auto& [label, path] : autoFolders)
+            if (label.find("/") != std::string::npos && label.find("Dancer") != std::string::npos) { pick = path; break; }
+        if (pick.empty() && autoFolders.size() > 1) pick = autoFolders[1].second;
+        setAutoFolder(pick);
+        int inside = 0;
+        for (int k = 0; k < 10; k++) {
+            int a = smartPick(0);
+            if (a >= 0 && inAutoFolder(a)) inside++;
+            AutoPickScope scope;
+            int b = pickRandom(decks[0].cur);
+            if (b >= 0 && inAutoFolder(b)) inside++;
+        }
+        testNote("auto folder lock: " + autoFolderLabel() + " pool=" + std::to_string(autoView.size()) + " inside=" + std::to_string(inside) + "/20" +
+                 " folders=" + std::to_string(autoFolders.size()));
+        S.showStatus = true;
+        autoMenuTestOpen = true;
+    });
+    at(0.8, [] { pendingShot = "24-auto-menu"; });
+    at(0.5, [] { setAutoFolder(""); ImGui::CloseCurrentPopup(); });
+    at(2.0, [] {
+        int before = decks[onAirDeck()].cur;
+        panicSafe();
+        wdBefore = before;
+    });
+    at(2.0, [] {
+        testNote("panic: safe=" + std::string(lib[decks[onAirDeck()].cur].path == S.safePreset ? "yes" : "no") + " from=" + std::to_string(wdBefore));
     });
     at(1.0, [] { running = false; });
 }
@@ -4926,14 +5308,17 @@ void migrateLegacy() {
     }
 }
 
+double startTime = 0;
 int main(int argc, char** argv) {
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    startTime = now();
     std::string extraFolder;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--selftest" && i + 1 < argc) selftestDir = argv[++i];
         else if (a == "--perftest" && i + 1 < argc) { selftestDir = argv[++i]; perfMode = true; }
         else if (a == "--add-folder" && i + 1 < argc) extraFolder = argv[++i];
+        else if (a == "--recovered") recoveredStart = true;
     }
     if (selftestDir.empty()) migrateLegacy();
     std::string base = selftestDir.empty() ? plat::appDataDir() : selftestDir;
@@ -5072,6 +5457,19 @@ int main(int argc, char** argv) {
     startAudioFrom(S.audioKind, S.audioDevice, true);
 
     rescan();
+    if (selftestDir.empty()) {
+        sessionCheckAtStart();
+        if (lastRunCrashed && !crashedPreset.empty()) {
+            auto cit = byPath.find(crashedPreset);
+            if (cit != byPath.end()) markBroken(cit->second, "crashed Amethyst");
+            for (std::string* last : {&S.lastA, &S.lastB})
+                if (*last == crashedPreset) last->clear();
+        }
+        if (recoveredStart) toast(true, "Amethyst restarted itself after a problem and is back on air");
+        else if (lastRunCrashed) toast(true, "Amethyst did not close properly last time%s", crashedPreset.empty() ? "" : " — the preset that was loading is now marked broken");
+        sessionMark("");
+        plat::installCrashRestart(!recoveredStart);  // after an auto-restart, arm again only once it has run a while
+    }
     for (int d = 0; d < 2; d++) {
         auto it = byPath.find(d ? S.lastB : S.lastA);
         int first = it != byPath.end() ? it->second : (view.empty() ? -1 : (d ? pickRandom(-1) : view[0]));
@@ -5167,7 +5565,7 @@ int main(int argc, char** argv) {
         if (launch.armed && beatNow() >= launch.dueBeat - 0.02) {
             launch.armed = false;
             if (launch.idx == -2) back(launch.deck, launch.hard);
-            else if (launch.random || launch.idx < 0) go(launch.deck, 1, launch.hard, true);
+            else if (launch.random || launch.idx < 0) { AutoPickScope scope(launch.fromAuto); go(launch.deck, 1, launch.hard, true); }
             else if (!loadPreset(launch.deck, launch.idx, launch.hard)) go(launch.deck, 1, true);
         }
         // auto-pilot
@@ -5193,6 +5591,13 @@ int main(int argc, char** argv) {
         SDL_GL_MakeCurrent(win, ctx);
         commitLoads();
         renderFrame(t, dt);
+        watchdogTick(t, dt);
+        {
+            static double lastSave = t;
+            if (selftestDir.empty() && t - lastSave > 60) { lastSave = t; saveSettings(); }  // a crash loses little
+            static bool armed = false;
+            if (!armed && t - lastSave >= 0 && recoveredStart && selftestDir.empty() && t > 30 + startTime) { armed = true; plat::installCrashRestart(true); }
+        }
 
         // control window
         int cw, ch;
@@ -5237,6 +5642,7 @@ int main(int argc, char** argv) {
 
     saveScenes();
     if (looksDirty) saveLooks();
+    if (selftestDir.empty()) { std::error_code ec; fs::remove(fs::u8path(sessionPath()), ec); }
     djLink.stop();
     spoutRx.ReleaseReceiver();
     if (tempo.source() == Tempo::Source::External) tempo.setSource(Tempo::Source::Auto);

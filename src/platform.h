@@ -22,4 +22,8 @@ void openPath(const std::string& path);
 std::string documentsDir();  // ...\Documents
 std::string videosDir();     // ...\Videos
 
+// Show safety: restart the app (with --recovered) if it crashes. armed=false only installs the handler.
+void installCrashRestart(bool armed);
+void restartSelf();
+
 }  // namespace plat
