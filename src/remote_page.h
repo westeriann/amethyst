@@ -20,6 +20,7 @@ h2{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--a);m
 button{font:inherit;color:var(--text);background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 8px;min-height:54px;touch-action:manipulation}
 button:active{background:#2b2442;border-color:var(--a)}
 button.on{border-color:var(--b);background:rgba(78,230,200,.16)}
+button.hit{background:#3a2d5c;border-color:var(--a)}
 .slider{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:10px 12px;grid-column:1/-1}
 .slider label{display:flex;justify-content:space-between;color:var(--dim);font-size:13px}
 input[type=range]{width:100%;height:34px;accent-color:var(--a)}
@@ -29,7 +30,16 @@ input[type=range]{width:100%;height:34px;accent-color:var(--a)}
 <main id="app"></main>
 <script>
 const app=document.getElementById('app');let actions=[];const sliders={},toggles={};
-const send=(id,v)=>fetch('/a/'+encodeURIComponent(id)+(v===undefined?'':'?v='+v),{method:'POST'}).catch(()=>{});
+// Taps go out immediately on a kept-alive connection; a poll never overwrites a toggle the user just tapped.
+const send=(id,v)=>fetch('/a/'+encodeURIComponent(id)+(v===undefined?'':'?v='+v),{method:'POST',keepalive:true}).catch(()=>{});
+const recent={};  // id -> time of the last local change
+// Sliders: one request in flight per slider, always carrying the newest value.
+const pending={},inflight={};
+function sendLatest(id){
+  if(inflight[id]||pending[id]===undefined)return;
+  const v=pending[id];delete pending[id];inflight[id]=true;
+  send(id,v).finally(()=>{inflight[id]=false;sendLatest(id)});
+}
 async function build(){
   actions=await (await fetch('/actions')).json();const groups={};
   for(const a of actions)(groups[a.group]=groups[a.group]||[]).push(a);
@@ -41,12 +51,16 @@ async function build(){
         const w=document.createElement('div');w.className='slider';
         w.innerHTML='<label><span></span><b></b></label><input type="range" min="0" max="1000">';
         w.querySelector('span').textContent=a.label;const r=w.querySelector('input'),b=w.querySelector('b');
-        let t=0;r.oninput=()=>{b.textContent=(r.value/1000).toFixed(2);clearTimeout(t);t=setTimeout(()=>send(a.id,r.value/1000),25)};
+        r.oninput=()=>{b.textContent=(r.value/1000).toFixed(2);recent[a.id]=Date.now();pending[a.id]=r.value/1000;sendLatest(a.id)};
         sliders[a.id]={r,b,busy:()=>document.activeElement===r};grid.appendChild(w);
       }else{
         const bt=document.createElement('button');bt.textContent=a.label;
         if(a.kind==='momentary'){bt.onpointerdown=()=>send(a.id,1);bt.onpointerup=bt.onpointerleave=()=>send(a.id,0);}
-        else bt.onclick=()=>send(a.id);
+        else bt.onclick=()=>{
+          if(a.kind==='toggle'){bt.classList.toggle('on');recent[a.id]=Date.now();}  // show the new state at once
+          else{bt.classList.add('hit');setTimeout(()=>bt.classList.remove('hit'),180);}
+          send(a.id);
+        };
         if(a.kind==='toggle')toggles[a.id]=bt;grid.appendChild(bt);
       }
     }
@@ -57,7 +71,9 @@ async function poll(){
     document.getElementById('now').textContent=s.a+(s.x>0.02?'  ⇄  '+s.b:'');
     document.getElementById('bpm').textContent=s.bpm.toFixed(1)+' BPM · '+s.src;
     document.querySelectorAll('#beat i').forEach((e,i)=>e.classList.toggle('on',i===s.beat));
-    for(const [id,v] of Object.entries(s.values)){if(sliders[id]&&!sliders[id].busy()){sliders[id].r.value=v*1000;sliders[id].b.textContent=v.toFixed(2)}
+    for(const [id,v] of Object.entries(s.values)){
+      if(Date.now()-(recent[id]||0)<1200)continue;  // the user just changed it here
+      if(sliders[id]&&!sliders[id].busy()){sliders[id].r.value=v*1000;sliders[id].b.textContent=v.toFixed(2)}
       if(toggles[id])toggles[id].classList.toggle('on',v>0.5)}
     document.getElementById('err').textContent='';
   }catch(e){document.getElementById('err').textContent='offline'}

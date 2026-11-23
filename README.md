@@ -22,6 +22,8 @@ The old browser-based prototype lives in [`browser-version/`](browser-version/) 
 * Two decks (A/B) with a crossfader and 7 mix modes: crossfade, add, screen, multiply, difference,
   lighten, luma key. `Tab` switches which deck you're driving; `\` auto-crossfades.
 * Auto-pilot (in order or shuffled, optional A/B auto-mixing), launch quantize to beat / bar / 4 bars.
+* **Smart auto-mix** follows the song: it detects song start, end and change, breakdowns, build-ups and drops, switches on 8-bar phrase boundaries, cuts to an intense preset exactly on the drop (prepared ahead of time), and goes calm with a long blend in breakdowns.
+* Presets compile on background threads, so clicking a preset or using the phone remote never stalls the picture.
 * Tempo: automatic BPM + phase detection from the audio, tap tempo (`T`), or **Ableton Link**.
 * 10 cue slots with live thumbnails.
 
@@ -79,7 +81,7 @@ The old browser-based prototype lives in [`browser-version/`](browser-version/) 
   **More like this** (right-click a preset, or Ctrl+M). **Hide broken** presets.
 * Favorites (`Ctrl+D`), star ratings (`Ctrl+1…5`), tags, setlists with drag-to-reorder (`Ctrl+L`
   adds to the active one), pools (All / Favorites / rating / tag / setlist), folder categories, search.
-* Live **preset editor** (`E`): edit the .milk code, apply instantly (`Ctrl+Enter`), save as a new preset.
+* **Visual preset editor** (`E`): plain-English sliders, switches and colour pickers for motion, trails, waveform, borders, shapes and extra waves; one-click "Make it dance" recipes (pulse with the bass, spin with the treble, shake on the beat...); Surprise me; undo/redo; live preview while you drag. The raw .milk code is still there under "Code (advanced)". Save as a new preset with Ctrl+S.
 
 **Interface**
 * Every panel hides individually, and `U` hides everything. Panels move and resize; the layout is remembered.

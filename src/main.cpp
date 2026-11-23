@@ -20,6 +20,9 @@
 #include "midi.h"
 #include "net.h"
 #include "platform.h"
+#include "player.h"
+#include "preset_editor.h"
+#include "structure.h"
 #include "remote_page.h"
 #include "stagelinq.h"
 #include "tempo.h"
@@ -66,7 +69,7 @@ const char* kOutputSources[] = {"Final output", "Deck A", "Deck B", "Mix (before
 struct Settings {
     float blend = 2;
     int interval = 20;
-    bool autoOn = false, shuffle = true, autoDecks = false;
+    bool autoOn = false, shuffle = true, autoDecks = false, smartMix = true;
     int quantize = 2;            // auto-pilot launch grid
     bool quantizeManual = false; // also quantize manual launches
     float gain = 1, speed = 1;
@@ -128,7 +131,7 @@ struct Field { const char* key; char type; void* p; };
 std::vector<Field> fields() {
     return {
         {"blend", 'f', &S.blend}, {"interval", 'i', &S.interval}, {"auto", 'b', &S.autoOn}, {"shuffle", 'b', &S.shuffle},
-        {"auto_decks", 'b', &S.autoDecks}, {"quantize", 'i', &S.quantize}, {"quantize_manual", 'b', &S.quantizeManual},
+        {"auto_decks", 'b', &S.autoDecks}, {"smart_mix", 'b', &S.smartMix}, {"quantize", 'i', &S.quantize}, {"quantize_manual", 'b', &S.quantizeManual},
         {"gain", 'f', &S.gain}, {"speed", 'f', &S.speed}, {"quality", 'i', &S.quality}, {"xfade", 'f', &S.xfade}, {"mix_mode", 'i', &S.mixMode},
         {"show_menu", 'b', &S.showMenu}, {"show_browser", 'b', &S.showBrowser}, {"show_hud", 'b', &S.showHud}, {"show_cues", 'b', &S.showCues},
         {"show_toasts", 'b', &S.showToasts}, {"show_status", 'b', &S.showStatus}, {"show_mixer", 'b', &S.showMixer}, {"show_fx", 'b', &S.showFx},
@@ -208,15 +211,31 @@ int sourceFilter = -1;
 std::vector<std::string> sourceNames;
 int sel = 0, upcoming = -1;
 
+// A deck owns two threaded projectM players: the visible one keeps animating while the other loads
+// the next preset off the main thread; when it is ready we crossfade (or cut) to it, then swap roles.
 struct Deck {
     const char* name;
-    projectm_handle pm = nullptr;
-    RenderTarget rt;
+    PresetPlayer players[2];
+    int active = 0;
+    bool blending = false;
+    double blendStart = 0, blendDur = 0;
+    RenderTarget rt;       // only used while blending between the two players
+    unsigned outTex = 0;   // what the compositor uses this frame
     int cur = -1;
+    // in-flight load
+    int pendingIdx = -1, pendingToken = 0, pendingDir = 1, failStreak = 0;
+    bool pendingHard = false, pendingRecord = true, pendingAdvance = false, pendingRandom = false, pendingEditor = false;
+    bool pendingHold = false;       // keep the loaded preset ready on the spare until releaseHeld()
+    int heldIdx = -1;               // preset waiting on the spare player
+    double pendingBlendSecs = -1;   // blend override for this load (-1 = normal)
     std::vector<std::string> hist;
     double time = 0, lastSwitch = 0;
-    std::string failPath, failMsg;
+    PresetPlayer& visible() { return players[active]; }
+    PresetPlayer& spare() { return players[1 - active]; }
 };
+int loadTokens = 0;
+std::vector<SDL_Window*> playerWindows;
+std::vector<SDL_GLContext> playerContexts;
 Deck decks[2] = {{"A"}, {"B"}};
 int focus = 0;
 bool locked = false;
@@ -273,12 +292,18 @@ bool keyboardOpen = false;
 float bandBass = 0, bandMid = 0, bandTreb = 0, bandLevel = 0;
 float peakBass = 0.05f, peakMid = 0.05f, peakTreb = 0.05f, peakLevel = 0.05f;
 double transitionSeconds();
+void startXfade(float to, double dur);
+MusicStructure structure;
+int xfadeOnLoad = -1;  // A/B auto-mix: crossfade to this deck once its preset has compiled
+double xfadeOnLoadSecs = 0;
 std::string captureAction;        // keyboard editor: next key press gets bound to this action
 SDL_Window* keyWindow = nullptr;  // window that received the last key press
 std::map<std::pair<int, int>, std::string> keymap;
 std::vector<std::tuple<int, int, std::string>> savedKeys;
 std::map<std::string, SDL_Keycode> heldMomentary;
 bool editorOpen = false, editorDirty = false;
+VisualPresetEditor visualEditor;
+double editorApplyAt = 0;
 std::string editorText, editorPath, editorStatus;
 int audioMenuSel = 0;
 std::vector<AudioDevice> audioDevices;
@@ -464,7 +489,7 @@ void applyTexturePaths() {
     std::vector<const char*> c;
     for (auto& p : paths) c.push_back(p.c_str());
     for (auto& d : decks)
-        if (d.pm && !c.empty()) projectm_set_texture_search_paths(d.pm, c.data(), c.size());
+        for (auto& p : d.players) p.setTexturePaths(paths);
     thumbs.setTexturePaths(paths);
 }
 
@@ -627,12 +652,6 @@ void markBroken(int idx, const std::string& why) {
 Meta& metaOf(int idx) { return meta[lib[idx].path]; }
 
 // ===================================================================== decks & navigation
-void deckFailCb(const char* file, const char* msg, void* user) {
-    auto* d = static_cast<Deck*>(user);
-    d->failPath = file ? file : "";
-    d->failMsg = msg ? msg : "";
-}
-
 int stepFrom(int base, int dir) {
     if (view.empty()) return -1;
     auto it = std::find(view.begin(), view.end(), base);
@@ -654,26 +673,22 @@ int pickRandom(int exclude) {
     return stepFrom(exclude, 1);
 }
 
+// Queue a preset on the deck's spare player. Never blocks: the switch happens in commitLoads()
+// once the preset has compiled and rendered its first frames.
 bool loadPreset(int d, int idx, bool hard, bool record = true) {
     Deck& dk = decks[d];
-    if (idx < 0 || idx >= (int)lib.size() || !dk.pm) return false;
-    Preset& p = lib[idx];
-    dk.failPath.clear();
-    projectm_set_soft_cut_duration(dk.pm, std::max(0.01f, S.blend));
-    projectm_load_preset_file(dk.pm, p.path.c_str(), !hard && S.blend > 0);
-    if (!dk.failPath.empty()) {
-        markBroken(idx, dk.failMsg);
-        toast(true, "Skipped \"%s\" — %s", p.name.c_str(), dk.failMsg.c_str());
-        dk.failPath.clear();
-        return false;
-    }
-    if (record && dk.cur >= 0 && dk.cur != idx) {
-        dk.hist.push_back(lib[dk.cur].path);
-        if (dk.hist.size() > 300) dk.hist.erase(dk.hist.begin());
-    }
-    dk.cur = idx;
-    dk.lastSwitch = now();
-    (d ? S.lastB : S.lastA) = p.path;
+    if (idx < 0 || idx >= (int)lib.size()) return false;
+    if (dk.blending) { dk.blending = false; }  // the spare is about to be reused: finish the running blend
+    dk.pendingIdx = idx;
+    dk.pendingToken = ++loadTokens;
+    dk.pendingHard = hard;
+    dk.pendingRecord = record;
+    dk.pendingAdvance = false;
+    dk.pendingEditor = false;
+    dk.pendingHold = false;
+    dk.heldIdx = -1;
+    dk.pendingBlendSecs = -1;
+    dk.spare().load(lib[idx].path, dk.pendingToken);
     if (d == focus) {
         auto it = std::find(view.begin(), view.end(), idx);
         if (it != view.end()) { sel = (int)(it - view.begin()); scrollToSel = true; }
@@ -681,20 +696,74 @@ bool loadPreset(int d, int idx, bool hard, bool record = true) {
     return true;
 }
 
+int navBase(int d) { return decks[d].pendingIdx >= 0 ? decks[d].pendingIdx : decks[d].cur; }
+
 void go(int d, int dir, bool hard, bool random = false) {
     if (view.empty()) { toast(true, query.empty() ? "No presets in this pool — add a folder (Ctrl+Shift+O)" : "No presets match the search"); return; }
-    for (int tries = 0; tries < 12; tries++) {
-        int target;
-        if (random) {
-            target = (upcoming >= 0 && upcoming != decks[d].cur && !lib[upcoming].broken) ? upcoming : pickRandom(decks[d].cur);
-            upcoming = -1;
-        } else {
-            target = stepFrom(decks[d].cur, dir);
+    int target;
+    if (random) {
+        target = (upcoming >= 0 && upcoming != decks[d].cur && !lib[upcoming].broken) ? upcoming : pickRandom(navBase(d));
+        upcoming = -1;
+    } else {
+        target = stepFrom(navBase(d), dir);
+    }
+    if (target < 0) return;
+    loadPreset(d, target, hard);
+    decks[d].pendingAdvance = true;  // if it fails to load, try the next one
+    decks[d].pendingDir = dir;
+    decks[d].pendingRandom = random;
+}
+
+// Called every frame: finish loads that the player threads completed.
+void commitLoads() {
+    for (int d = 0; d < 2; d++) {
+        Deck& dk = decks[d];
+        PresetPlayer::LoadResult r;
+        while (dk.spare().takeResult(r)) {
+            if (r.token != dk.pendingToken) continue;  // superseded by a newer request
+            int idx = dk.pendingIdx;
+            dk.pendingIdx = -1;
+            dk.pendingToken = 0;
+            if (dk.pendingEditor) {
+                editorStatus = r.ok ? "Applied to deck " + std::string(dk.name) : "Error: " + r.error;
+                if (r.ok) { dk.active = 1 - dk.active; dk.blending = false; }
+                continue;
+            }
+            if (!r.ok) {
+                if (idx >= 0) {
+                    markBroken(idx, r.error);
+                    toast(true, "Skipped \"%s\" — %s", lib[idx].name.c_str(), r.error.c_str());
+                }
+                if (dk.pendingAdvance && ++dk.failStreak < 12) go(d, dk.pendingDir, dk.pendingHard, dk.pendingRandom);
+                continue;
+            }
+            dk.failStreak = 0;
+            if (dk.pendingHold) {
+                dk.pendingHold = false;
+                dk.heldIdx = idx;
+                continue;
+            }
+            if (dk.pendingRecord && dk.cur >= 0 && dk.cur != idx) {
+                dk.hist.push_back(lib[dk.cur].path);
+                if (dk.hist.size() > 300) dk.hist.erase(dk.hist.begin());
+            }
+            dk.cur = idx;
+            dk.lastSwitch = now();
+            if (idx >= 0) (d ? S.lastB : S.lastA) = lib[idx].path;
+            dk.active = 1 - dk.active;  // the freshly loaded player becomes visible
+            double bd = dk.pendingBlendSecs >= 0 ? dk.pendingBlendSecs : S.blend;
+            dk.blending = !dk.pendingHard && bd > 0.01;
+            dk.blendStart = now();
+            dk.blendDur = bd;
+            if (xfadeOnLoad == d) {
+                startXfade(d ? 1.f : 0.f, xfadeOnLoadSecs);
+                xfadeOnLoad = -1;
+            }
         }
-        if (target < 0) return;
-        if (loadPreset(d, target, hard)) return;
     }
 }
+
+bool anyLoading() { return decks[0].pendingIdx >= 0 || decks[1].pendingIdx >= 0; }
 
 void back(int d, bool hard) {
     Deck& dk = decks[d];
@@ -735,7 +804,10 @@ void autoAdvance() {
     if (S.autoDecks) {
         int off = S.xfade < 0.5f ? 1 : 0;
         int target = S.shuffle ? pickRandom(decks[off].cur) : stepFrom(decks[1 - off].cur, 1);
-        if (target >= 0 && loadPreset(off, target, true)) startXfade(off ? 1.f : 0.f, transitionSeconds());
+        if (target >= 0 && loadPreset(off, target, true)) {
+            xfadeOnLoad = off;
+            xfadeOnLoadSecs = transitionSeconds();
+        }
     } else {
         int on = S.xfade < 0.5f ? 0 : 1;
         requestLaunch(on, -1, 1, false, S.shuffle, false);
@@ -874,10 +946,11 @@ bool pumpAudio() {
     bassAvg += (bass - bassAvg) * 0.05f;
     if (hit) lastBeatHit = t;
     tempo.feed(s, n, t);
+    structure.feed(s, n, t, tempo.beatAt(t), tempo.bpm());
     size_t maxS = projectm_pcm_get_max_samples();
     size_t off = n > maxS ? n - maxS : 0;
     for (auto& d : decks)
-        if (d.pm) projectm_pcm_add_float(d.pm, s + off * 2, (unsigned)(n - off), PROJECTM_STEREO);
+        for (auto& p : d.players) p.pushAudio(s + off * 2, n - off);
     thumbs.pushAudio(s, n);
     return hit;
 }
@@ -933,8 +1006,8 @@ int outputIndexForWindow(Uint32 id) {
 
 unsigned outputTexture(int source) {
     switch (source) {
-        case 1: return decks[0].rt.tex;
-        case 2: return decks[1].rt.tex;
+        case 1: return decks[0].outTex;
+        case 2: return decks[1].outTex;
         case 3: return mixRT.tex;
         default: return finalRT.tex;
     }
@@ -1402,6 +1475,7 @@ void updateDjLink(double t) {
         bool first = djLastTitle.empty();
         djLastTitle = d.title;
         djTitleText = d.artist.empty() ? d.title : d.artist + "  -  " + d.title;
+        if (!first) structure.trackChanged(t, tempo.beatAt(t));
         if (S.djShowTitle) djTitleUntil = t + S.djTitleSecs;
         if (!first) {
             switch (S.djTrackAction) {
@@ -1572,6 +1646,143 @@ bool smartPoolMatch(int i) {
 }
 
 
+// ---- smart auto-mix: follows the song structure, prepares the next preset ahead of time and
+// switches exactly on the bar / drop.
+struct Smart {
+    bool prep = false;
+    int deck = -1, idx = -1;
+    int fireOn = 0;  // 0 = at fireBeat, 1 = on the next drop, 2 = when the next song starts
+    double fireBeat = 0, blend = 0;
+    bool hard = false;
+    double lastSwitch = 0;
+    std::string lastEvent;
+    double lastEventAt = -100;
+} smart;
+
+int onAirDeck() { return S.xfade < 0.5f ? 0 : 1; }
+
+int smartPick(int energy) {
+    int on = onAirDeck();
+    if (energy == 0) return S.shuffle ? pickRandom(decks[on].cur) : stepFrom(decks[on].cur, 1);
+    std::vector<int> c;
+    for (int i : view) {
+        if (lib[i].broken || i == decks[0].cur || i == decks[1].cur) continue;
+        auto it = looks.find(lib[i].path);
+        if (it == looks.end()) continue;
+        float m = it->second.motion;
+        if (energy > 0 ? m > 0.35f : m < 0.12f) c.push_back(i);
+    }
+    if (c.empty()) return pickRandom(decks[on].cur);
+    return c[std::uniform_int_distribution<size_t>(0, c.size() - 1)(rng)];
+}
+
+bool releaseHeld(int d, double blendSecs) {
+    Deck& dk = decks[d];
+    if (dk.heldIdx < 0) return false;
+    int idx = dk.heldIdx;
+    dk.heldIdx = -1;
+    if (dk.cur >= 0 && dk.cur != idx) {
+        dk.hist.push_back(lib[dk.cur].path);
+        if (dk.hist.size() > 300) dk.hist.erase(dk.hist.begin());
+    }
+    dk.cur = idx;
+    dk.lastSwitch = now();
+    (d ? S.lastB : S.lastA) = lib[idx].path;
+    dk.active = 1 - dk.active;
+    dk.blending = blendSecs > 0.01;
+    dk.blendStart = now();
+    dk.blendDur = blendSecs;
+    return true;
+}
+
+void smartCancel() {
+    if (smart.prep && smart.deck >= 0) {
+        Deck& dk = decks[smart.deck];
+        if (dk.heldIdx == smart.idx) dk.heldIdx = -1;
+        if (dk.pendingIdx == smart.idx && dk.pendingHold) { dk.pendingIdx = -1; dk.pendingToken = 0; dk.pendingHold = false; }
+    }
+    smart.prep = false;
+}
+bool smartValid() {
+    Deck& dk = decks[smart.deck];
+    if (S.autoDecks) return dk.pendingIdx == smart.idx || dk.cur == smart.idx;
+    return (dk.pendingIdx == smart.idx && dk.pendingHold) || dk.heldIdx == smart.idx;
+}
+bool smartReady() {
+    Deck& dk = decks[smart.deck];
+    return S.autoDecks ? dk.pendingIdx < 0 && dk.cur == smart.idx : dk.heldIdx == smart.idx;
+}
+bool smartPrepare(int energy, int fireOn, double fireBeat, double blend, bool hard) {
+    smartCancel();
+    int on = onAirDeck(), d = S.autoDecks ? 1 - on : on;
+    if (S.autoDecks ? xanim.active : decks[d].blending) return false;  // the spare is still in use
+    int idx = smartPick(energy);
+    if (idx < 0 || !loadPreset(d, idx, true)) return false;
+    if (!S.autoDecks) decks[d].pendingHold = true;
+    smart.prep = true;
+    smart.deck = d, smart.idx = idx, smart.fireOn = fireOn, smart.fireBeat = fireBeat, smart.blend = blend, smart.hard = hard;
+    return true;
+}
+void smartFire(double t) {
+    if (S.autoDecks) startXfade(smart.deck ? 1.f : 0.f, smart.hard ? 0.04 : smart.blend);
+    else releaseHeld(smart.deck, smart.hard ? 0 : smart.blend);
+    smart.prep = false;
+    smart.lastSwitch = t;
+}
+double barSeconds() { return 240.0 / std::max(30.0, tempo.bpm()); }
+int phraseBars() {
+    double bars = S.interval / barSeconds();
+    return bars >= 8 ? 8 : bars >= 4 ? 4 : bars >= 2 ? 2 : 1;
+}
+
+void smartTick(double t) {
+    double beat = beatNow(), lead = 1.5 / barSeconds() * 4;  // ~1.5 s for the preset to compile
+    auto events = structure.take();
+    bool active = S.autoOn && S.smartMix && !locked;
+    for (auto& e : events) {
+        smart.lastEvent = MusicStructure::name(e.type);
+        smart.lastEventAt = t;
+        if (!active) continue;
+        double nextBar = structure.nextBoundary(beat + lead, 1);
+        switch (e.type) {
+            case MusicStructure::DropHit:
+                if (smart.prep && smart.fireOn == 1 && smartReady()) smartFire(t);
+                else if (smartPrepare(1, 0, beat, 0, true)) smart.fireBeat = beat;  // cut as soon as it compiles
+                break;
+            case MusicStructure::BreakdownStart: smartPrepare(-1, 0, nextBar, barSeconds() * 4, false); break;
+            case MusicStructure::SongStart:
+                if (smart.prep && smart.fireOn == 2 && smartReady()) smartFire(t);
+                else smartPrepare(0, 0, nextBar, transitionSeconds(), false);
+                break;
+            case MusicStructure::SongChange: smartPrepare(0, 0, nextBar, transitionSeconds(), false); break;
+            case MusicStructure::SongEnd: smartPrepare(0, 2, 0, 0, true); break;
+        }
+    }
+    if (!active) {
+        if (smart.prep) smartCancel();
+        return;
+    }
+    if (smart.prep && !smartValid()) smart.prep = false;  // failed to load, or the user took over the deck
+    auto sec = structure.section();
+    bool low = sec == MusicStructure::Breakdown || sec == MusicStructure::Build;
+    if (smart.prep) {
+        if (smart.fireOn == 0 && beat >= smart.fireBeat - 0.02) {
+            if (smartReady()) smartFire(t);
+            else smart.fireBeat = structure.nextBoundary(beat, 1);  // still compiling: next bar
+        } else if (smart.fireOn == 1 && !low) {  // breakdown ended without a clear drop
+            smart.fireOn = 0, smart.hard = false, smart.blend = transitionSeconds();
+            smart.fireBeat = structure.nextBoundary(beat, 1);
+        }
+        return;
+    }
+    double since = t - std::max(smart.lastSwitch, decks[onAirDeck()].lastSwitch);
+    if (low) {
+        if (since > 2) smartPrepare(1, 1, 0, 0, true);  // have the drop preset ready
+    } else if (sec != MusicStructure::Silence && since >= S.interval - 2) {
+        smartPrepare(0, 0, structure.nextBoundary(beat + lead, phraseBars()), transitionSeconds(), false);
+    }
+}
+
 void sortSimilar(std::vector<int>& v) {
     std::string refPath = S.pool.substr(8);
     auto ref = looks.find(refPath);
@@ -1714,7 +1925,6 @@ void renderFrame(double t, double dt) {
     if (w != renderW || h != renderH) {
         renderW = w;
         renderH = h;
-        for (auto& d : decks) projectm_set_window_size(d.pm, w, h);
     }
     applyModulation(beatNow());
     // Deck B is only rendered when it can be seen.
@@ -1723,12 +1933,21 @@ void renderFrame(double t, double dt) {
     for (int d = 0; d < 2; d++) {
         if (d == 1 && !needB) continue;
         Deck& dk = decks[d];
-        dk.rt.ensure(w, h);
         if (!frozen) {
             dk.time += dt * S.speed;
-            projectm_set_frame_time(dk.pm, dk.time);
-            dk.rt.bind();
-            projectm_opengl_render_frame_fbo(dk.pm, dk.rt.fbo);
+            dk.visible().requestFrame(dk.time, w, h);
+        }
+        // the spare renders while it is loading (to warm up) or fading out
+        if (dk.spare().loading() || dk.blending) dk.spare().requestFrame(dk.time, w, h);
+        unsigned cur = dk.visible().texture();
+        if (dk.blending) {
+            float k = (float)std::clamp((t - dk.blendStart) / std::max(0.01, dk.blendDur), 0.0, 1.0);
+            dk.rt.ensure(w, h);
+            gfx.mix(dk.rt, dk.spare().texture(), cur, k * k * (3 - 2 * k), MixCrossfade);
+            dk.outTex = dk.rt.tex;
+            if (k >= 1) dk.blending = false;
+        } else {
+            dk.outTex = cur;
         }
     }
     mixRT.ensure(w, h);
@@ -1737,9 +1956,9 @@ void renderFrame(double t, double dt) {
     if (xanim.active && S.transition > 0 && needB) {
         bool toB = xanim.to > xanim.from;
         float p = toB ? S.xfade : 1 - S.xfade;
-        gfx.transition(mixRT, decks[toB ? 0 : 1].rt.tex, decks[toB ? 1 : 0].rt.tex, std::clamp(p, 0.f, 1.f), S.transition, (float)t);
+        gfx.transition(mixRT, decks[toB ? 0 : 1].outTex, decks[toB ? 1 : 0].outTex, std::clamp(p, 0.f, 1.f), S.transition, (float)t);
     } else {
-        gfx.mix(mixRT, decks[0].rt.tex, needB ? decks[1].rt.tex : decks[0].rt.tex, needB ? modOut.xfade : 0.f, S.mixMode);
+        gfx.mix(mixRT, decks[0].outTex, needB ? decks[1].outTex : decks[0].outTex, needB ? modOut.xfade : 0.f, S.mixMode);
     }
     fxRotation += (float)(S.fx.rotateSpeed * dt);
     int prev = fxIdx;
@@ -1812,6 +2031,7 @@ void registerActions() {
     trig("xfade_auto", "Auto crossfade", "Mixer", [] { startXfade(S.xfade < 0.5f ? 1.f : 0.f, transitionSeconds()); });
     trig("mix_mode", "Mix mode", "Mixer", [] { S.mixMode = (S.mixMode + 1) % MixModeCount; toast(false, "Mix: %s", mixModeName(S.mixMode)); });
     toggle("auto_decks", "Auto-mix decks", "Mixer", &S.autoDecks);
+    toggle("smart_mix", "Smart auto-mix (follow the song)", "Auto-pilot", &S.smartMix);
 
     toggle("auto", "Auto-pilot", "Auto-pilot", &S.autoOn, [] { decks[0].lastSwitch = decks[1].lastSwitch = now(); });
     toggle("shuffle", "Shuffle", "Auto-pilot", &S.shuffle);
@@ -1895,7 +2115,7 @@ void registerActions() {
     step("gain_down", "Sensitivity -", "Performance", [] { setGain(S.gain / 1.2f); });
     trig("quality", "Render quality", "Performance", [] {
         S.quality = (S.quality + 1) % 4;
-        for (auto& d : decks) projectm_set_mesh_size(d.pm, kQuality[S.quality].meshW, kQuality[S.quality].meshH);
+        for (auto& d : decks) for (auto& p : d.players) p.setMesh(kQuality[S.quality].meshW, kQuality[S.quality].meshH);
         toast(false, "Quality: %s", kQuality[S.quality].label);
     });
     for (int r = 0; r <= 5; r++) {
@@ -2238,14 +2458,18 @@ void openEditor() {
     editorText.assign((std::istreambuf_iterator<char>(f)), {});
     editorPath = lib[cur].path;
     editorDirty = false;
+    editorApplyAt = 0;
+    visualEditor.open(editorText);
     editorStatus = "Editing deck " + std::string(decks[focus].name) + ": " + lib[cur].name;
 }
 void applyEditor() {
     Deck& d = decks[focus];
-    d.failPath.clear();
-    projectm_load_preset_data(d.pm, editorText.c_str(), false);
-    editorStatus = d.failPath.empty() && d.failMsg.empty() ? "Applied to deck " + std::string(d.name) : "Error: " + d.failMsg;
-    d.failMsg.clear();
+    d.blending = false;
+    d.pendingIdx = d.cur;
+    d.pendingToken = ++loadTokens;
+    d.pendingEditor = true;
+    d.spare().loadData(editorText, d.pendingToken);
+    editorStatus = "Compiling...";
 }
 void saveEditorAs() {
     std::string def = editorPath.empty() ? "My preset.milk" : fs::u8path(editorPath).stem().u8string() + " (edit).milk";
@@ -2567,7 +2791,7 @@ void drawMenuBar() {
         for (int q = 0; q < 4; q++)
             if (ImGui::MenuItem(kQuality[q].label, q == S.quality ? "Q" : nullptr, S.quality == q)) {
                 S.quality = q;
-                for (auto& d : decks) projectm_set_mesh_size(d.pm, kQuality[q].meshW, kQuality[q].meshH);
+                for (auto& d : decks) for (auto& p : d.players) p.setMesh(kQuality[q].meshW, kQuality[q].meshH);
             }
         ImGui::EndMenu();
     }
@@ -2681,6 +2905,7 @@ void drawBrowser(float top, float bottom) {
         int pend = thumbs.analysisPending();
         if (pend > 0 && S.analysisOn) ImGui::TextDisabled("analysing %d...", pend);
         else ImGui::TextDisabled("%d analysed", (int)looks.size());
+        if (pend > 0 && S.analysisOn && !thumbs.analysisEnabled) { ImGui::SameLine(); ImGui::TextDisabled("(paused while performing)"); }
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Presets are analysed in the background (colour, brightness, motion)\nfor the colour/energy pools and \"More like this\". Right-click to pause.");
         if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) { S.analysisOn = !S.analysisOn; thumbs.analysisEnabled = S.analysisOn; }
     }
@@ -2849,7 +3074,11 @@ void drawHud(float y, float h) {
     char b[128];
     double since = now() - decks[S.xfade < 0.5f ? 0 : 1].lastSwitch;
     double left = std::max(0.0, S.interval - since);
-    if (S.autoOn) snprintf(b, sizeof b, "AUTO %s  %s%s%s", locked ? "--" : (std::to_string((int)std::ceil(left)) + "s").c_str(), S.shuffle ? "shuffle" : "in order", S.autoDecks ? ", A/B mix" : "", keyHint("auto").c_str());
+    double hb = beatNow();
+    if (S.autoOn && S.smartMix)
+        snprintf(b, sizeof b, "AUTO smart  %s  bar %d/8%s%s", MusicStructure::name(structure.section()), structure.barInPhrase(hb) + 1,
+                 S.autoDecks ? ", A/B mix" : "", keyHint("auto").c_str());
+    else if (S.autoOn) snprintf(b, sizeof b, "AUTO %s  %s%s%s", locked ? "--" : (std::to_string((int)std::ceil(left)) + "s").c_str(), S.shuffle ? "shuffle" : "in order", S.autoDecks ? ", A/B mix" : "", keyHint("auto").c_str());
     else snprintf(b, sizeof b, "AUTO off%s", keyHint("auto").c_str());
     pill(b, kAccent2, S.autoOn, "Auto-pilot (A). Interval , .  Shuffle S.  Quantize K", [] { actions.invoke("auto", true); });
     if (locked) pill(("LOCKED" + keyHint("lock")).c_str(), kWarn, true, nullptr, [] { locked = false; });
@@ -2880,7 +3109,7 @@ void deckColumn(int d, float w) {
     bool foc = focus == d;
     ImGui::TextColored(foc ? kAccent2 : kDim, "DECK %s%s", dk.name, foc ? "  (focus)" : "");
     float h = w * 9 / 16.f;
-    if (dk.rt.tex) imageFlipped(dk.rt.tex, ImVec2(w, h));
+    if (dk.outTex) imageFlipped(dk.outTex, ImVec2(w, h));
     else ImGui::Dummy(ImVec2(w, h));
     if (ImGui::IsItemClicked()) focus = d;
     ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + w);
@@ -2921,6 +3150,16 @@ void drawMixer() {
     ImGui::SameLine();
     if (ImGui::Button("Auto crossfade  ( \\ )")) actions.invoke("xfade_auto", true);
     ImGui::Checkbox("Auto-pilot mixes A/B (loads the next preset on the hidden deck, then crossfades)", &S.autoDecks);
+    ImGui::Checkbox("Smart auto-mix: follow the song", &S.smartMix);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Switches on phrase boundaries, cuts to an intense preset exactly on the drop,\n"
+                          "goes calm with a long blend in breakdowns, and changes when a new song starts.");
+    if (S.smartMix) {
+        double hb = beatNow();
+        ImGui::TextDisabled("Now: %s   bar %d/8, beat %d   energy %.2f   last: %s", MusicStructure::name(structure.section()),
+                            structure.barInPhrase(hb) + 1, structure.beatInBar(hb) + 1, structure.energy(),
+                            smart.lastEvent.empty() ? "-" : smart.lastEvent.c_str());
+    }
     ImGui::SetNextItemWidth(200);
     if (ImGui::BeginCombo("Transition", transitionName(S.transition))) {
         for (int k = 0; k < TransitionCount; k++)
@@ -3267,20 +3506,56 @@ int editorResize(ImGuiInputTextCallbackData* d) {
 void drawEditor() {
     ImGui::SetNextWindowSize(ImVec2(760, 640), ImGuiCond_FirstUseEver);
     if (!ImGui::Begin("Preset editor", &editorOpen, ImGuiWindowFlags_NoCollapse)) { ImGui::End(); return; }
-    if (ImGui::Button("Apply  Ctrl+Enter")) applyEditor();
+    static bool live = true;
+    auto edited = [&] {
+        editorDirty = true;
+        if (live) editorApplyAt = now() + 0.15;  // debounce: compile once the user pauses
+    };
+    ImGuiIO& io = ImGui::GetIO();
+    bool focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) && !io.WantTextInput;
+    ImGui::BeginDisabled(!visualEditor.canUndo());
+    if ((ImGui::Button("Undo") || (focused && io.KeyCtrl && !io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_Z))) &&
+        visualEditor.undo(editorText))
+        edited();
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!visualEditor.canRedo());
+    if ((ImGui::Button("Redo") || (focused && io.KeyCtrl && (ImGui::IsKeyPressed(ImGuiKey_Y) || (io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_Z))))) &&
+        visualEditor.redo(editorText))
+        edited();
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button("Revert") && visualEditor.revert(editorText)) edited();
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Go back to the preset as it was when you opened it.");
     ImGui::SameLine();
     if (ImGui::Button("Save as...  Ctrl+S")) saveEditorAs();
     ImGui::SameLine();
-    if (ImGui::Button("Reload current")) openEditor();
+    if (ImGui::Button("Edit current preset")) openEditor();
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Load the preset now playing on the focused deck.");
     ImGui::SameLine();
-    static bool live = false;
-    ImGui::Checkbox("Live apply", &live);
+    ImGui::Checkbox("Live", &live);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show every change on screen straight away.");
+    if (!live) {
+        ImGui::SameLine();
+        if (ImGui::Button("Apply  Ctrl+Enter")) applyEditor();
+    }
     ImGui::TextDisabled("%s%s", editorStatus.c_str(), editorDirty ? "  (modified)" : "");
-    editorText.reserve(editorText.size() + 1);
-    if (ImGui::InputTextMultiline("##code", editorText.data(), editorText.capacity() + 1, ImVec2(-1, -1),
-                                  ImGuiInputTextFlags_CallbackResize | ImGuiInputTextFlags_AllowTabInput, editorResize, &editorText)) {
-        editorDirty = true;
-        if (live) applyEditor();
+    if (editorText.empty()) ImGui::TextWrapped("Pick a preset first, then press \"Edit current preset\".");
+    if (ImGui::BeginTabBar("##edtabs")) {
+        if (visualEditor.draw(editorText)) edited();
+        if (ImGui::BeginTabItem("Code (advanced)")) {
+            editorText.reserve(editorText.size() + 1);
+            if (ImGui::InputTextMultiline("##code", editorText.data(), editorText.capacity() + 1, ImVec2(-1, -1),
+                                          ImGuiInputTextFlags_CallbackResize | ImGuiInputTextFlags_AllowTabInput, editorResize, &editorText))
+                edited();
+            if (ImGui::IsItemDeactivatedAfterEdit()) visualEditor.external(editorText);
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+    if (editorApplyAt > 0 && now() >= editorApplyAt) {
+        editorApplyAt = 0;
+        applyEditor();
     }
     ImGui::End();
 }
@@ -3997,10 +4272,101 @@ std::string curName(int d) { return decks[d].cur >= 0 ? lib[decks[d].cur].name :
 
 UdpProbe artProbe;
 
+// ---- perf test: preset load cost and phone-remote latency (VortexVJ.exe --perftest <dir> --add-folder <presets>)
+bool perfMode = false;
+std::vector<double> perfFrames;
+std::string perfStats(std::vector<double> v) {
+    if (v.empty()) return "n=0";
+    std::sort(v.begin(), v.end());
+    double sum = 0;
+    for (double x : v) sum += x;
+    int over = (int)std::count_if(v.begin(), v.end(), [](double x) { return x > 40; });
+    char b[160];
+    snprintf(b, sizeof b, "n=%d avg=%.1f p50=%.1f p95=%.1f max=%.1f ms, >40ms: %d", (int)v.size(), sum / v.size(), v[v.size() / 2],
+             v[std::min(v.size() - 1, v.size() * 95 / 100)], v.back(), over);
+    return b;
+}
+std::vector<double> perfLoads, perfHttpA, perfHttpState;
+size_t perfMark = 0;
+std::atomic<bool> perfHttpDone{false};
+
+void buildPerfTest() {
+    double t = 2.5;
+    auto at = [&](double dt, std::function<void()> f) { t += dt; testSteps.push_back({t, std::move(f)}); };
+    at(0, [] {
+        if (getenv("AMETHYST_PERF_NO_ANALYSIS")) { S.analysisOn = false; thumbs.analysisEnabled = false; }
+        testNote("presets=" + std::to_string(lib.size()) + " render=" + std::to_string(renderW) + "x" + std::to_string(renderH) + " analysis=" + std::to_string(S.analysisOn));
+        perfMark = perfFrames.size();
+    });
+    at(2.0, [] { testNote("idle frames: " + perfStats(std::vector<double>(perfFrames.begin() + perfMark, perfFrames.end()))); perfMark = perfFrames.size(); });
+    for (int i = 0; i < 16; i++)
+        at(0.4, [i] {
+            int idx = pickRandom(decks[0].cur);
+            double t0 = now();
+            loadPreset(0, idx, i % 2 == 1);
+            perfLoads.push_back((now() - t0) * 1000.0);
+        });
+    at(0.5, [] {
+        testNote("loadPreset (main thread): " + perfStats(perfLoads));
+        testNote("frames during clicks: " + perfStats(std::vector<double>(perfFrames.begin() + perfMark, perfFrames.end())));
+        S.webOn = true;
+        applyNetSettings();
+        perfMark = perfFrames.size();
+        std::thread([] {
+            for (int i = 0; i < 40; i++) {
+                perfHttpA.push_back(httpRequestMs(S.webPort, "/a/fx_kaleido", "POST"));
+                perfHttpState.push_back(httpRequestMs(S.webPort, "/state"));
+                Sleep(40);
+            }
+            perfHttpDone = true;
+        }).detach();
+    });
+    at(6.0, [] {
+        testNote(std::string("remote done=") + (perfHttpDone ? "yes" : "no"));
+        testNote("remote /a/fx_kaleido: " + perfStats(perfHttpA));
+        testNote("remote /state: " + perfStats(perfHttpState));
+        testNote("frames during remote: " + perfStats(std::vector<double>(perfFrames.begin() + perfMark, perfFrames.end())));
+    });
+    at(0.5, [] { running = false; });
+}
+
 void buildSelftest() {
     double t = 2.5;
     auto at = [&](double dt, std::function<void()> f) { t += dt; testSteps.push_back({t, std::move(f)}); };
     at(0, [] { testNote("presets=" + std::to_string(lib.size()) + " A=" + curName(0) + " audio=" + audio.label() + " sources=" + std::to_string(sourceNames.size())); pendingShot = "01-start"; });
+    // smart auto-mix: synthetic 128 BPM track -> intro/groove 16 bars, breakdown 8 bars, drop 16 bars, silence
+    at(0, [] {
+        MusicStructure ms;
+        const double rate = 48000, bpm = 128, spb = 60 / bpm, t0 = 1.0;
+        const double total = t0 + 40 * 4 * spb + 3.0;
+        std::vector<float> blk(480 * 2);
+        std::mt19937 g(7);
+        std::uniform_real_distribution<float> nz(-1, 1);
+        std::string log;
+        for (size_t f0 = 0; f0 < (size_t)(total * rate); f0 += 480) {
+            for (int i = 0; i < 480; i++) {
+                double tt = (f0 + i) / rate, sb = (tt - t0) / spb;
+                float v = 0;
+                if (sb >= 0 && sb < 160) {
+                    double ph = (sb - std::floor(sb)) * spb;
+                    bool kick = sb < 64 || sb >= 96;
+                    if (kick) v += 0.7f * (float)(std::sin(2 * M_PI * 55 * ph) * std::exp(-ph / 0.12));
+                    v += 0.08f * (float)std::sin(2 * M_PI * 440 * tt);                       // pad
+                    if (sb >= 80 && sb < 96) v += 0.02f * (float)(sb - 80) * nz(g) * 0.3f;  // build: rising noise
+                    else v += 0.03f * nz(g) * (float)std::exp(-std::fmod(ph, spb / 2) / 0.03);  // hats
+                }
+                blk[i * 2] = blk[i * 2 + 1] = v;
+            }
+            double tt = f0 / rate;
+            ms.feed(blk.data(), 480, tt, (tt - t0) / spb, bpm);
+            for (auto& e : ms.take()) {
+                char b[96];
+                snprintf(b, sizeof b, "%s@%.2f ", MusicStructure::name(e.type), e.beat);
+                log += b;
+            }
+        }
+        testNote("structure: " + log);
+    });
     // decks + crossfader
     at(1.0, [] { pressKey(SDLK_TAB); pressKey(SDLK_r); testNote("focus=" + std::string(decks[focus].name) + " B=" + curName(1)); S.showMixer = true; });
     at(0.5, [] { actions.invoke("crossfade", true, true, 0.5f); S.mixMode = MixScreen; });
@@ -4040,6 +4406,23 @@ void buildSelftest() {
     // editor
     at(0.5, [] { S.showControl = false; openEditor(); testNote("editor chars=" + std::to_string(editorText.size())); });
     at(1.0, [] { pendingShot = "08-editor"; });
+    at(0.3, [] {
+        MilkDoc d;
+        d.parse(editorText);
+        bool rt = d.text() == editorText;
+        auto eq = d.perFrame();
+        eq.push_back("zoom = zoom + 0.08*(bass_att-1);");
+        d.setPerFrame(eq);
+        d.set("fDecay", 0.9, false);
+        MilkDoc d2;
+        d2.parse(d.text());
+        testNote("visual editor roundtrip=" + std::string(rt ? "ok" : "FAIL") + " perframe=" + std::to_string(d2.perFrame().size()) +
+                 "/" + std::to_string(eq.size()) + " decay=" + std::to_string(d2.get("fDecay", -1)));
+        editorText = d.text();
+        visualEditor.external(editorText);
+        applyEditor();
+    });
+    at(1.0, [] { testNote("visual editor apply: " + editorStatus); pendingShot = "08b-editor-visual"; });
     at(0.5, [] {
         editorOpen = false;
         keyboardOpen = true;
@@ -4215,6 +4598,7 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--selftest" && i + 1 < argc) selftestDir = argv[++i];
+        else if (a == "--perftest" && i + 1 < argc) { selftestDir = argv[++i]; perfMode = true; }
         else if (a == "--add-folder" && i + 1 < argc) extraFolder = argv[++i];
     }
     if (selftestDir.empty()) migrateLegacy();
@@ -4273,18 +4657,22 @@ int main(int argc, char** argv) {
     thumbCtx = SDL_GL_CreateContext(thumbWin);
     SDL_GL_MakeCurrent(win, ctx);
 
-    for (auto& d : decks) {
-        d.pm = projectm_create();
-        if (!d.pm) {
-            MessageBoxA(nullptr, "Could not start projectM.", "Amethyst", MB_ICONERROR);
-            return 1;
+    // Four preset players (two per deck), each with a hidden window + shared GL context and its own thread.
+    for (auto& d : decks)
+        for (auto& p : d.players) {
+            SDL_Window* pw = SDL_CreateWindow("", 0, 0, 16, 16, SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN);
+            SDL_GL_MakeCurrent(win, ctx);
+            SDL_GLContext pc = pw ? SDL_GL_CreateContext(pw) : nullptr;
+            SDL_GL_MakeCurrent(win, ctx);
+            if (!pc) {
+                MessageBoxA(nullptr, "Could not create the rendering threads (OpenGL context sharing failed).", "Amethyst", MB_ICONERROR);
+                return 1;
+            }
+            playerWindows.push_back(pw);
+            playerContexts.push_back(pc);
+            p.setMesh(kQuality[S.quality].meshW, kQuality[S.quality].meshH);
+            p.start(pw, pc);
         }
-        projectm_set_preset_switch_failed_event_callback(d.pm, deckFailCb, &d);
-        projectm_set_hard_cut_enabled(d.pm, false);
-        projectm_set_preset_duration(d.pm, 1e9);
-        projectm_set_aspect_correction(d.pm, true);
-        projectm_set_mesh_size(d.pm, kQuality[S.quality].meshW, kQuality[S.quality].meshH);
-    }
     gfx.init();
     if (thumbCtx) {
         thumbs.setFps(S.previewFps);
@@ -4367,7 +4755,7 @@ int main(int argc, char** argv) {
     else toast(false, "%d presets  -  %s  -  press H for shortcuts", (int)lib.size(), audio.label().c_str());
 
     double last = now();
-    if (!selftestDir.empty()) { buildSelftest(); testStart = now(); }
+    if (!selftestDir.empty()) { if (perfMode) buildPerfTest(); else buildSelftest(); testStart = now(); }
     SDL_Event e;
     while (running) {
         while (!selftestDir.empty() && testNext < testSteps.size() && now() - testStart >= testSteps[testNext].at) testSteps[testNext++].act();
@@ -4414,6 +4802,7 @@ int main(int argc, char** argv) {
 
         const double t = now();
         const double dt = std::clamp(t - last, 0.0, 0.25);
+        if (perfMode) perfFrames.push_back((t - last) * 1000.0);
         last = t;
 
         pumpAudio();
@@ -4426,7 +4815,11 @@ int main(int argc, char** argv) {
             static double slowSince = 0;
             float fps = ImGui::GetIO().Framerate;
             if (fps < 50) slowSince = t;
-            thumbs.analysisEnabled = S.analysisOn && t - slowSince > 3.0 && !recorder.active();
+            // Compiling presets for analysis briefly stalls the GPU driver, so never do it during a show:
+            // outputs open, fullscreen, interface hidden, Spout or recording running.
+            bool performing = !outputs.empty() || (SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN_DESKTOP) || S.uiHidden || S.spout ||
+                              recorder.active();
+            thumbs.analysisEnabled = S.analysisOn && !performing && t - slowSince > 3.0;
         }
         updateLeds(t);
         // crossfade animation
@@ -4444,7 +4837,8 @@ int main(int argc, char** argv) {
             else if (!loadPreset(launch.deck, launch.idx, launch.hard)) go(launch.deck, 1, true);
         }
         // auto-pilot
-        if (S.autoOn && !locked && !launch.armed && !xanim.active) {
+        smartTick(t);
+        if (S.autoOn && !S.smartMix && !locked && !launch.armed && !xanim.active) {
             int on = S.xfade < 0.5f ? 0 : 1;
             if (t - decks[on].lastSwitch >= S.interval) {
                 decks[on].lastSwitch = t;
@@ -4463,18 +4857,8 @@ int main(int argc, char** argv) {
         flashAmt = std::max(0.f, flashAmt - (float)dt / 0.35f);
 
         SDL_GL_MakeCurrent(win, ctx);
+        commitLoads();
         renderFrame(t, dt);
-        for (int d = 0; d < 2; d++) {
-            Deck& dk = decks[d];
-            if (dk.failPath.empty()) continue;
-            auto it = byPath.find(dk.failPath);
-            dk.failPath.clear();
-            if (it != byPath.end()) {
-                markBroken(it->second, dk.failMsg);
-                toast(true, "\"%s\" failed — skipping", lib[it->second].name.c_str());
-                if (it->second == dk.cur) go(d, 1, true);
-            }
-        }
 
         // control window
         int cw, ch;
@@ -4542,7 +4926,10 @@ int main(int argc, char** argv) {
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplSDL2_Shutdown();
     ImGui::DestroyContext(uiCtx);
-    for (auto& d : decks) projectm_destroy(d.pm);
+    for (auto& d : decks)
+        for (auto& p : d.players) p.stop();
+    for (auto c : playerContexts) SDL_GL_DeleteContext(c);
+    for (auto w : playerWindows) SDL_DestroyWindow(w);
     for (auto& o : outputs) SDL_DestroyWindow(o.win);
     if (thumbCtx) SDL_GL_DeleteContext(thumbCtx);
     SDL_DestroyWindow(thumbWin);

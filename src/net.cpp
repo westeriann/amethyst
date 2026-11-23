@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 namespace {
@@ -135,34 +136,55 @@ void HttpServer::poll(const std::function<HttpResponse(const std::string&, const
         SOCKET c = accept((SOCKET)sock_, nullptr, nullptr);
         if (c == INVALID_SOCKET) break;
         setNonBlocking(c);
+        BOOL nd = TRUE;
+        setsockopt(c, IPPROTO_TCP, TCP_NODELAY, (const char*)&nd, sizeof nd);
         clients_.push_back({(unsigned long long)c, {}, nowSec()});
     }
     const double t = nowSec();
     for (size_t i = 0; i < clients_.size();) {
         Client& cl = clients_[i];
-        char buf[4096];
-        int n = recv((SOCKET)cl.sock, buf, sizeof buf, 0);
-        if (n > 0) cl.buf.append(buf, n);
-        bool done = cl.buf.find("\r\n\r\n") != std::string::npos;
-        bool dead = n == 0 || (n < 0 && WSAGetLastError() != WSAEWOULDBLOCK) || t - cl.started > 3 || cl.buf.size() > 16384;
-        if (done) {
-            std::string line = cl.buf.substr(0, cl.buf.find("\r\n"));
+        bool dead = false;
+        for (;;) {  // drain everything that arrived
+            char buf[8192];
+            int n = recv((SOCKET)cl.sock, buf, sizeof buf, 0);
+            if (n > 0) { cl.buf.append(buf, n); cl.started = t; continue; }
+            if (n == 0 || WSAGetLastError() != WSAEWOULDBLOCK) dead = true;
+            break;
+        }
+        // Keep-alive: answer every complete request on this connection, in order.
+        for (;;) {
+            size_t end = cl.buf.find("\r\n\r\n");
+            if (end == std::string::npos) break;
+            std::string head = cl.buf.substr(0, end);
+            size_t bodyLen = 0;
+            std::string lower = head;
+            for (auto& ch : lower) ch = (char)tolower((unsigned char)ch);
+            size_t cl_ = lower.find("content-length:");
+            if (cl_ != std::string::npos) bodyLen = (size_t)std::strtoul(lower.c_str() + cl_ + 15, nullptr, 10);
+            if (cl.buf.size() < end + 4 + bodyLen) break;  // body still arriving
+            bool closeAfter = lower.find("connection: close") != std::string::npos;
+            cl.buf.erase(0, end + 4 + bodyLen);
+            std::string line = head.substr(0, head.find("\r\n"));
             std::string method = line.substr(0, line.find(' '));
             size_t p1 = line.find(' '), p2 = line.rfind(' ');
             std::string target = (p1 != std::string::npos && p2 > p1) ? line.substr(p1 + 1, p2 - p1 - 1) : "/";
             std::string path = target.substr(0, target.find('?'));
             std::string query = target.find('?') == std::string::npos ? "" : target.substr(target.find('?') + 1);
             HttpResponse r = handler(method, path, query);
-            std::string head = "HTTP/1.1 " + std::to_string(r.status) + (r.status == 200 ? " OK" : " Not Found") +
-                               "\r\nContent-Type: " + r.contentType + "\r\nContent-Length: " + std::to_string(r.body.size()) +
-                               "\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";
-            std::string all = head + r.body;
-            u_long off = 0;
-            ioctlsocket((SOCKET)cl.sock, FIONBIO, &off);  // small responses: just send them
-            send((SOCKET)cl.sock, all.data(), (int)all.size(), 0);
-            shutdown((SOCKET)cl.sock, SD_SEND);
-            dead = true;
+            std::string out = "HTTP/1.1 " + std::to_string(r.status) + (r.status == 200 ? " OK" : " Not Found") +
+                              "\r\nContent-Type: " + r.contentType + "\r\nContent-Length: " + std::to_string(r.body.size()) +
+                              "\r\nCache-Control: no-store\r\nConnection: " + (closeAfter ? "close" : "keep-alive") + "\r\n\r\n" + r.body;
+            size_t off = 0;
+            double until = nowSec() + 1.0;
+            while (off < out.size()) {  // responses are small; the socket buffer takes them at once
+                int n = send((SOCKET)cl.sock, out.data() + off, (int)(out.size() - off), 0);
+                if (n > 0) off += n;
+                else if (WSAGetLastError() == WSAEWOULDBLOCK && nowSec() < until) Sleep(0);
+                else { dead = true; break; }
+            }
+            if (closeAfter) { shutdown((SOCKET)cl.sock, SD_SEND); dead = true; break; }
         }
+        if (t - cl.started > 15 || cl.buf.size() > 65536) dead = true;  // idle keep-alive connection
         if (dead) {
             closesocket((SOCKET)cl.sock);
             clients_.erase(clients_.begin() + i);
@@ -251,4 +273,27 @@ bool UdpProbe::receive(std::vector<unsigned char>& out) {
 void UdpProbe::close() {
     if (sock_ != ~0ull) closesocket((SOCKET)sock_);
     sock_ = ~0ull;
+}
+
+// ------------------------------------------------------------------ perf-test HTTP client
+double httpRequestMs(int port, const std::string& path, const char* method) {
+    if (!netInit()) return -1;
+    double t0 = nowSec();
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port = htons((u_short)port);
+    inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
+    if (connect(s, (sockaddr*)&a, sizeof a) != 0) { closesocket(s); return -1; }
+    std::string req = std::string(method) + " " + path + " HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    send(s, req.data(), (int)req.size(), 0);
+    char buf[8192];
+    bool got = false;
+    while (true) {
+        int n = recv(s, buf, sizeof buf, 0);
+        if (n <= 0) break;
+        got = true;
+    }
+    closesocket(s);
+    return got ? (nowSec() - t0) * 1000.0 : -1;
 }

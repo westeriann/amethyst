@@ -30,7 +30,7 @@ target_link_libraries(spout PUBLIC opengl32 d3d11 dxgi gdi32 version winmm shlwa
 set(IMGUI ${TP}/imgui)
 add_executable(Amethyst WIN32
   src/main.cpp src/audio.cpp src/thumbs.cpp src/platform_win.cpp src/gfx.cpp src/midi.cpp
-  src/net.cpp src/tempo.cpp src/media.cpp src/image.cpp src/stagelinq.cpp
+  src/net.cpp src/tempo.cpp src/media.cpp src/image.cpp src/stagelinq.cpp src/player.cpp src/preset_editor.cpp src/structure.cpp
   ${TP}/stb/wfETC.c ${TP}/stb/image_DXT.c
   ${IMGUI}/imgui.cpp ${IMGUI}/imgui_draw.cpp ${IMGUI}/imgui_tables.cpp ${IMGUI}/imgui_widgets.cpp
   ${IMGUI}/backends/imgui_impl_sdl2.cpp ${IMGUI}/backends/imgui_impl_opengl3.cpp

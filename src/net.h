@@ -76,3 +76,6 @@ public:
 private:
     unsigned long long sock_ = ~0ull;
 };
+
+// Blocking local HTTP request (perf test). Returns round-trip milliseconds, or -1 on failure.
+double httpRequestMs(int port, const std::string& path, const char* method = "GET");
