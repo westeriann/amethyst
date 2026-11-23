@@ -1,0 +1,8 @@
+Vendored libraries (all MIT licensed, (c) Jordan Berg):
+- butterchurn 2.6.7 (+ butterchurnExtraImages)
+- butterchurn-presets 2.4.7
+- milkdrop-preset-converter 0.1.2
+See LICENSE-butterchurn.txt for the license text.
+
+NOTE: vendor/milkdrop-preset-converter.min.js has one local patch: the GetBlur1/2/3 macros are
+parenthesised to avoid a converter bug (see shader-fix.js).

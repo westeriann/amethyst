@@ -1,0 +1,13 @@
+# build output (releases are published on GitHub, not committed)
+dist/
+build/
+*.zip
+*.obj
+*.o
+
+# editor / OS noise
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini

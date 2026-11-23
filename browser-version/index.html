@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Amethyst</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="stage" class="stage">
+  <canvas id="viz"></canvas>
+  <video id="preview" muted playsinline autoplay></video>
+  <div class="fx-blackout"></div>
+  <div class="fx-flash"></div>
+</div>
+
+<div id="ui">
+  <!-- Top bar -->
+  <header id="topbar" class="panel">
+    <div class="brand"><span class="logo"></span>Amethyst</div>
+    <div class="top-actions">
+      <button data-act="browser" title="Preset browser (P)">Presets <kbd>P</kbd></button>
+      <button data-act="import" title="Open .milk files (Ctrl+O)">Open .milk <kbd>Ctrl O</kbd></button>
+      <button data-act="audio" title="Audio input (I)">Audio <kbd>I</kbd></button>
+      <button data-act="output" title="Projector / second-screen output (O)">Output <kbd>O</kbd></button>
+      <button data-act="fullscreen" title="Fullscreen (F)">Fullscreen <kbd>F</kbd></button>
+      <button data-act="help" title="Keyboard shortcuts (H)">Keys <kbd>H</kbd></button>
+    </div>
+  </header>
+
+  <!-- Preset browser -->
+  <aside id="browser" class="panel" hidden>
+    <div class="browser-head">
+      <input id="search" type="search" placeholder="Search presets…  ( / )" autocomplete="off" spellcheck="false">
+      <div class="chips" id="pools">
+        <button data-pool="all">All <span></span></button>
+        <button data-pool="user">Imported <span></span></button>
+        <button data-pool="builtin">Built-in <span></span></button>
+      </div>
+      <div class="hint">↑↓ select · Enter load · Shift+Enter hard cut · Esc back · <kbd>G</kbd> cycles pool</div>
+    </div>
+    <div id="list" tabindex="-1"><div id="list-spacer"></div></div>
+    <div class="browser-foot">
+      <div id="bg-status"></div>
+      <div class="foot-actions">
+        <button data-act="import">+ Files</button>
+        <button data-act="import-folder">+ Folder</button>
+        <button data-act="clear-user" class="danger">Clear imported</button>
+      </div>
+    </div>
+  </aside>
+
+  <!-- HUD -->
+  <footer id="hud" class="panel">
+    <div class="hud-row">
+      <div class="now">
+        <div id="now-name">—</div>
+        <div id="now-sub"></div>
+      </div>
+      <div class="meter-wrap" title="Input level · beat">
+        <div id="beat-dot"></div>
+        <div class="meter"><div id="meter-fill"></div></div>
+        <div id="audio-label">No audio</div>
+      </div>
+    </div>
+    <div class="hud-row pills" id="pills"></div>
+    <div class="cues" id="cues"></div>
+  </footer>
+
+  <div id="toast"></div>
+
+  <!-- Audio input menu -->
+  <div id="menu" class="panel" hidden>
+    <div class="menu-title">Audio input</div>
+    <ul id="menu-list"></ul>
+    <div class="hint">↑↓ choose · Enter select · Esc close</div>
+  </div>
+
+  <!-- Help -->
+  <div id="help" class="modal" hidden>
+    <div class="panel help-card">
+      <div class="help-head"><h2>Keyboard</h2><span class="hint">H or ? to close</span></div>
+      <div class="help-grid">
+        <section>
+          <h3>Presets</h3>
+          <dl>
+            <dt><kbd>Space</kbd> <kbd>→</kbd></dt><dd>Next preset</dd>
+            <dt><kbd>←</kbd></dt><dd>Previous (history)</dd>
+            <dt><kbd>R</kbd></dt><dd>Random preset</dd>
+            <dt><kbd>Shift</kbd> + any of above</dt><dd>Hard cut (no blend)</dd>
+            <dt><kbd>[</kbd> <kbd>]</kbd></dt><dd>Blend time − / +</dd>
+            <dt><kbd>L</kbd></dt><dd>Lock preset (pauses auto-pilot)</dd>
+            <dt><kbd>T</kbd></dt><dd>Show preset name on screen</dd>
+          </dl>
+        </section>
+        <section>
+          <h3>Cues</h3>
+          <dl>
+            <dt><kbd>1</kbd> … <kbd>0</kbd></dt><dd>Fire cue slot</dd>
+            <dt><kbd>Shift</kbd> + <kbd>1</kbd> … <kbd>0</kbd></dt><dd>Store current preset in slot</dd>
+            <dt><kbd>Alt</kbd> + <kbd>1</kbd> … <kbd>0</kbd></dt><dd>Clear slot</dd>
+          </dl>
+          <h3>Auto-pilot</h3>
+          <dl>
+            <dt><kbd>A</kbd></dt><dd>Auto-pilot on / off</dd>
+            <dt><kbd>,</kbd> <kbd>.</kbd></dt><dd>Interval − / +</dd>
+            <dt><kbd>K</kbd></dt><dd>Beat-sync switches on / off</dd>
+            <dt><kbd>S</kbd></dt><dd>Shuffle / in-order</dd>
+          </dl>
+        </section>
+        <section>
+          <h3>Performance</h3>
+          <dl>
+            <dt><kbd>B</kbd></dt><dd>Blackout (fade to black)</dd>
+            <dt><kbd>X</kbd></dt><dd>White flash</dd>
+            <dt>hold <kbd>Z</kbd></dt><dd>Freeze frame</dd>
+            <dt><kbd>-</kbd> <kbd>=</kbd></dt><dd>Speed − / +</dd>
+            <dt><kbd>Backspace</kbd></dt><dd>Reset speed to 1×</dd>
+            <dt><kbd>↑</kbd> <kbd>↓</kbd></dt><dd>Audio sensitivity</dd>
+            <dt><kbd>Q</kbd></dt><dd>Render quality</dd>
+          </dl>
+        </section>
+        <section>
+          <h3>View &amp; files</h3>
+          <dl>
+            <dt><kbd>F</kbd></dt><dd>Fullscreen (works in output too)</dd>
+            <dt><kbd>O</kbd></dt><dd>Output window for projector</dd>
+            <dt><kbd>U</kbd></dt><dd>Hide / show interface</dd>
+            <dt><kbd>P</kbd> / <kbd>Tab</kbd></dt><dd>Preset browser</dd>
+            <dt><kbd>/</kbd></dt><dd>Search presets</dd>
+            <dt><kbd>G</kbd></dt><dd>Pool: all / imported / built-in</dd>
+            <dt><kbd>I</kbd></dt><dd>Audio input</dd>
+            <dt><kbd>M</kbd> · <kbd>Shift</kbd>+<kbd>M</kbd></dt><dd>Play audio file · pause/resume</dd>
+            <dt><kbd>Ctrl</kbd>+<kbd>O</kbd></dt><dd>Open .milk files (<kbd>Shift</kbd> = folder)</dd>
+            <dt>Drag &amp; drop</dt><dd>.milk / .json presets, folders, textures, audio</dd>
+          </dl>
+        </section>
+      </div>
+    </div>
+  </div>
+
+  <!-- Splash -->
+  <div id="splash" class="modal">
+    <div class="panel splash-card">
+      <div class="splash-logo"><span class="logo big"></span></div>
+      <h1>Amethyst</h1>
+      <p class="sub">MilkDrop-compatible visuals, driven by your keyboard.</p>
+      <div class="splash-buttons">
+        <button data-start="mic" class="primary">🎤 Microphone / line-in <kbd>Enter</kbd></button>
+        <button data-start="system">🖥 System or tab audio <kbd>2</kbd></button>
+        <button data-start="file">🎵 Play an audio file <kbd>3</kbd></button>
+        <button data-start="none">Visuals only <kbd>4</kbd></button>
+      </div>
+      <p class="hint">Drop .milk presets anywhere at any time. Press <kbd>H</kbd> for every shortcut.</p>
+      <p id="splash-err" class="err"></p>
+    </div>
+  </div>
+
+  <div id="dropzone"><div>Drop .milk presets, folders, textures or an audio file</div></div>
+</div>
+
+<input type="file" id="file-milk" multiple accept=".milk,.json,.jpg,.jpeg,.png" hidden>
+<input type="file" id="folder-milk" webkitdirectory multiple hidden>
+<input type="file" id="file-audio" accept="audio/*,video/*" hidden>
+<audio id="player" crossorigin="anonymous"></audio>
+
+<script src="vendor/butterchurn.min.js"></script>
+<script src="vendor/butterchurnExtraImages.min.js"></script>
+<script src="vendor/butterchurnPresets.min.js"></script>
+<script src="vendor/butterchurnPresetsExtra.min.js"></script>
+<script src="vendor/butterchurnPresetsExtra2.min.js"></script>
+<script src="shader-fix.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

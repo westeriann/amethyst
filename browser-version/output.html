@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Amethyst — Output</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  body { cursor: none; }
+  .tip { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); color: #ccc; font: 13px "Segoe UI", sans-serif;
+         background: rgba(0,0,0,0.6); padding: 6px 12px; border-radius: 999px; transition: opacity 1s; pointer-events: none; }
+  .tip.gone { opacity: 0; }
+</style>
+</head>
+<body>
+<div class="stage">
+  <canvas id="viz"></canvas>
+  <div class="fx-blackout"></div>
+  <div class="fx-flash"></div>
+</div>
+<div class="tip" id="tip">Drag me to the projector · double-click or press F for fullscreen · all shortcuts work here</div>
+<script>
+  // This window is only a screen: the control window drives rendering into this canvas.
+  const host = () => (window.opener && !window.opener.closed && window.opener.VJ) || null;
+  window.addEventListener('keydown', e => { const h = host(); if (h) h.handleKey(e); });
+  window.addEventListener('keyup', e => { const h = host(); if (h) h.handleKeyUp(e); });
+  window.addEventListener('blur', () => { const h = host(); if (h) h.handleBlur(); });
+  window.addEventListener('dblclick', () => {
+    if (document.fullscreenElement) document.exitFullscreen(); else document.documentElement.requestFullscreen().catch(() => {});
+  });
+  setTimeout(() => document.getElementById('tip').classList.add('gone'), 5000);
+  const h = host();
+  if (h) h.outputReady(window);
+  else document.getElementById('tip').textContent = 'Open this window from Amethyst (press O in the control window).';
+</script>
+</body>
+</html>
