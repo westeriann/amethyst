@@ -23,6 +23,7 @@ void applyTexturePaths() {
     for (auto& d : decks)
         for (auto& p : d.players) p.setTexturePaths(paths);
     thumbs.setTexturePaths(paths);
+    mappingSetTexturePaths(paths);
 }
 
 const Setlist* poolSetlist() {
@@ -239,9 +240,11 @@ int pickRandom(int exclude) {
 void sessionMark(const std::string& loading);
 // Queue a preset on the deck's spare player. Never blocks: the switch happens in commitLoads()
 // once the preset has compiled and rendered its first frames.
+void notePickManual(int replaced, double shownFor, int chosen);
 bool loadPreset(int d, int idx, bool hard, bool record = true) {
     Deck& dk = decks[d];
     if (idx < 0 || idx >= (int)lib.size()) return false;
+    if (!autoPicking && S.autoOn && selftestDir.empty()) notePickManual(dk.cur, now() - dk.lastSwitch, idx);
     if (dk.blending) { dk.blending = false; dk.blendManual = -1; }  // the spare is about to be reused: finish the running blend
     dk.pendingIdx = idx;
     dk.pendingToken = ++loadTokens;

@@ -1,4 +1,5 @@
 // Ripple: a water ring leaves the centre on every beat; bigger on the bass and on drops.
+// fit: calm 0.6 groove 0.8 drop 0.6
 // Custom Amethyst effect. Inputs: iChannel0 (picture), iChannel1 (last output), iResolution, iTime,
 // iBeat, iBeatPhase (0..1 inside the beat), iBass, iMid, iTreble, iLevel, iDrop (1 on a drop, fading), iVocal.
 void mainImage(out vec4 fragColor, in vec2 fragCoord) {

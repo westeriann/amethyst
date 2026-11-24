@@ -146,6 +146,7 @@ void registerActions() {
     trig("quality", "Render quality", "Performance", [] {
         S.quality = (S.quality + 1) % 4;
         for (auto& d : decks) for (auto& p : d.players) p.setMesh(kQuality[S.quality].meshW, kQuality[S.quality].meshH);
+        mappingSetMesh(kQuality[S.quality].meshW, kQuality[S.quality].meshH);
         toast(false, "Quality: %s", kQuality[S.quality].label);
     });
     for (int r = 0; r <= 5; r++) {
@@ -215,6 +216,7 @@ void registerActions() {
     actions.all().back().get = [] { return S.dmxOn ? 1.f : 0.f; };
     panel("panel_scenes", "Scenes panel", &S.showScenes);
     panel("panel_mod", "Modulation panel", &S.showMod);
+    panel("panel_mapping", "Projection mapping", &S.showMapping);
     local("similar", "More like the current preset", "Library", [] { if (decks[focus].cur >= 0) setPool("similar:" + lib[decks[focus].cur].path); });
 }
 

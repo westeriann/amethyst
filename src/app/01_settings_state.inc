@@ -8,13 +8,15 @@ struct Quality { const char* label; float scale; int meshW, meshH; };
 const Quality kQuality[] = {{"Low", 0.5f, 32, 24}, {"Medium", 0.75f, 48, 36}, {"High", 1.0f, 64, 48}, {"Ultra", 1.0f, 128, 96}};
 const char* kQuantizeNames[] = {"Off", "Beat", "Bar", "4 bars"};
 const int kQuantizeBeats[] = {0, 1, 4, 16};
-const char* kOutputSources[] = {"Final output", "Deck A", "Deck B", "Mix (before FX)"};
+const char* kOutputSources[] = {"Final output", "Deck A", "Deck B", "Mix (before FX)", "Projection map"};
 
 struct Settings {
     float blend = 2;
     int interval = 20;
     bool autoOn = false, shuffle = true, autoDecks = false, smartMix = true, fakeoutRecut = true, autoFx = true, autoFxFlash = true;
     float autoFxAmount = 0.7f;   // how hard Auto FX pushes the effects
+    int journey = 0;             // auto-pilot mood: 0 off, 1..8 a mood, 9 wander through them
+    float autoTexture = 0.6f;    // Auto FX groove texture: small moves on hi-hats and snares (strongest in quiet parts)
     float buildTease = 0.35f;    // how far the drop preset fades in during a build-up (0 = off)
     bool smartBlends = true;     // drops smash both presets together with a layer blend
     bool watchdog = true;        // show safety: skip presets that go black, freeze or crawl
@@ -65,6 +67,7 @@ struct Settings {
     int layerSource = 0, cameraIndex = 0;
     std::string spoutInput;
     bool showScenes = false, showMod = false;
+    bool showMapping = false, mapOutlines = false, mapPreview = false;  // projection mapping window, edge outlines, map in the main window
     // lighting
     bool dmxOn = false;
     std::string dmxIp = "255.255.255.255";
@@ -85,7 +88,7 @@ struct Field { const char* key; char type; void* p; };
 std::vector<Field> fields() {
     return {
         {"blend", 'f', &S.blend}, {"interval", 'i', &S.interval}, {"auto", 'b', &S.autoOn}, {"shuffle", 'b', &S.shuffle},
-        {"auto_decks", 'b', &S.autoDecks}, {"smart_mix", 'b', &S.smartMix}, {"fakeout_recut", 'b', &S.fakeoutRecut}, {"auto_fx", 'b', &S.autoFx}, {"auto_fx_flash", 'b', &S.autoFxFlash}, {"auto_fx_amount", 'f', &S.autoFxAmount}, {"build_tease", 'f', &S.buildTease}, {"smart_blends", 'b', &S.smartBlends}, {"watchdog", 'b', &S.watchdog}, {"safe_preset", 's', &S.safePreset}, {"auto_folder", 's', &S.autoFolder}, {"vocal_ease", 'b', &S.vocalEase}, {"user_shader", 's', &S.userShader}, {"user_shader_amt", 'f', &S.userShaderAmount}, {"auto_fx_shaders", 'b', &S.autoFxShaders}, {"quantize", 'i', &S.quantize}, {"quantize_manual", 'b', &S.quantizeManual},
+        {"auto_decks", 'b', &S.autoDecks}, {"smart_mix", 'b', &S.smartMix}, {"fakeout_recut", 'b', &S.fakeoutRecut}, {"auto_fx", 'b', &S.autoFx}, {"auto_fx_flash", 'b', &S.autoFxFlash}, {"auto_fx_amount", 'f', &S.autoFxAmount}, {"auto_texture", 'f', &S.autoTexture}, {"journey", 'i', &S.journey}, {"build_tease", 'f', &S.buildTease}, {"smart_blends", 'b', &S.smartBlends}, {"watchdog", 'b', &S.watchdog}, {"safe_preset", 's', &S.safePreset}, {"auto_folder", 's', &S.autoFolder}, {"vocal_ease", 'b', &S.vocalEase}, {"user_shader", 's', &S.userShader}, {"user_shader_amt", 'f', &S.userShaderAmount}, {"auto_fx_shaders", 'b', &S.autoFxShaders}, {"quantize", 'i', &S.quantize}, {"quantize_manual", 'b', &S.quantizeManual},
         {"gain", 'f', &S.gain}, {"speed", 'f', &S.speed}, {"quality", 'i', &S.quality}, {"xfade", 'f', &S.xfade}, {"mix_mode", 'i', &S.mixMode},
         {"show_menu", 'b', &S.showMenu}, {"show_browser", 'b', &S.showBrowser}, {"show_hud", 'b', &S.showHud}, {"show_cues", 'b', &S.showCues},
         {"show_toasts", 'b', &S.showToasts}, {"show_status", 'b', &S.showStatus}, {"show_mixer", 'b', &S.showMixer}, {"show_fx", 'b', &S.showFx},
@@ -111,7 +114,7 @@ std::vector<Field> fields() {
         {"docs_folder_added", 'b', &S.docsFolderAdded}, {"audio_kind", 's', &S.audioKind}, {"audio_device", 's', &S.audioDevice},
         {"transition", 'i', &S.transition}, {"trans_beats", 'f', &S.transBeats}, {"scene_morph_beats", 'f', &S.sceneMorphBeats},
         {"layer_source", 'i', &S.layerSource}, {"camera_index", 'i', &S.cameraIndex}, {"spout_input", 's', &S.spoutInput},
-        {"show_scenes", 'b', &S.showScenes}, {"show_mod", 'b', &S.showMod}, {"dmx_on", 'b', &S.dmxOn}, {"dmx_ip", 's', &S.dmxIp},
+        {"show_scenes", 'b', &S.showScenes}, {"show_mod", 'b', &S.showMod}, {"show_mapping", 'b', &S.showMapping}, {"map_outlines", 'b', &S.mapOutlines}, {"map_preview", 'b', &S.mapPreview}, {"dmx_on", 'b', &S.dmxOn}, {"dmx_ip", 's', &S.dmxIp},
         {"dmx_universe", 'i', &S.dmxUniverse}, {"dmx_fixtures", 'i', &S.dmxFixtures}, {"dmx_start", 'i', &S.dmxStart}, {"dmx_mode", 'i', &S.dmxMode},
         {"dmx_level", 'f', &S.dmxLevel}, {"dj_on", 'b', &S.djOn}, {"dj_tempo", 'b', &S.djTempo}, {"dj_show_title", 'b', &S.djShowTitle},
         {"dj_track_action", 'i', &S.djTrackAction}, {"dj_title_secs", 'f', &S.djTitleSecs}, {"hide_broken", 'b', &S.hideBroken},
@@ -208,6 +211,19 @@ RenderTarget mixRT, fxRT[2], finalRT;
 int fxIdx = 0, renderW = 0, renderH = 0;
 float fxRotation = 0;
 
+// projection mapping (13_mapping.inc)
+void mappingEvent(MusicStructure::Event e);
+void mappingPushAudio(const float* s, size_t n);
+void mappingSetMesh(int w, int h);
+void mappingSetTexturePaths(const std::vector<std::string>& paths);
+bool mappingNeeded();
+void mappingRender(double t, double dt);
+unsigned mappingTexture();
+void drawMapping();
+void mappingContextMenu(int idx);
+void mappingLoad();
+void mappingShutdown();
+
 struct Output {
     SDL_Window* win = nullptr;
     int display = -1;
@@ -277,6 +293,7 @@ struct RenderJob {
 // custom shader effects (ShaderToy-style .glsl files)
 struct UserShader {
     std::string name, path, err;
+    float fit[3] = {0.6f, 0.7f, 0.7f};  // how well it suits calm / groove / drop (from a "// fit:" line in the file)
     unsigned prog = 0;
     bool tried = false;
     long long mtime = 0;

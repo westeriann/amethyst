@@ -1,4 +1,5 @@
 // VHS: scanlines, wobbling tracking, colour bleed and noise. The tape freaks out on drops.
+// fit: calm 0.7 groove 0.6 drop 0.3
 float hash(vec2 p) { return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
 
 void mainImage(out vec4 fragColor, in vec2 fragCoord) {

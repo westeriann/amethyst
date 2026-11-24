@@ -3,8 +3,8 @@
 void saveScenes();
 
 // ---- modulation routing
-enum ModSrc { SrcBass, SrcMid, SrcTreble, SrcLevel, SrcBeat, SrcLfoSine, SrcLfoSaw, SrcLfoSquare, SrcLfoRandom, SrcVocal, SrcEnergy, SrcCount };
-const char* kModSrcNames[] = {"Bass", "Mids", "Treble", "Level", "Beat pulse", "LFO sine", "LFO saw", "LFO square", "LFO random", "Vocals", "Song energy"};
+enum ModSrc { SrcBass, SrcMid, SrcTreble, SrcLevel, SrcBeat, SrcLfoSine, SrcLfoSaw, SrcLfoSquare, SrcLfoRandom, SrcVocal, SrcEnergy, SrcHats, SrcSnare, SrcCount };
+const char* kModSrcNames[] = {"Bass", "Mids", "Treble", "Level", "Beat pulse", "LFO sine", "LFO saw", "LFO square", "LFO random", "Vocals", "Song energy", "Hi-hat hits", "Snare / clap hits"};
 bool isLfo(int src) { return src >= SrcLfoSine && src <= SrcLfoRandom; }
 enum ModDst { DstZoom, DstRotate, DstSwirl, DstHue, DstSat, DstContrast, DstBright, DstRgb, DstFeedback, DstPixel, DstKaleido,
               DstCrossfade, DstVideoOpacity, DstLogoOpacity, DstTextOpacity, DstCount };
@@ -27,6 +27,8 @@ float modSource(int src, double beat) {
         case SrcBeat: { float f = 1 - frac(beat); return f * f; }
         case SrcVocal: return structure.vocal();
         case SrcEnergy: return std::min(1.f, structure.energy());
+        case SrcHats: return structure.hat();
+        case SrcSnare: return structure.snare();
         default: break;
     }
     return 0;

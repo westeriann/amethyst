@@ -41,10 +41,15 @@ void loadLooks() {
 }
 int analysisQueued = 0;
 bool analyseNow = false;  // run the analysis even while performing (button in the browser)
+// Presets auto-pilot can pick right now (its folder, then the browser's pool) are analysed first.
 void queueAnalysis() {
     std::vector<std::string> todo;
-    for (auto& p : lib)
-        if (!p.broken && !looks.count(p.path)) todo.push_back(p.path);
+    std::vector<char> first(lib.size(), 0);
+    for (int i : autoView) first[i] = 2;
+    for (int i : view) first[i] = std::max<char>(first[i], 1);
+    for (int pass = 2; pass >= 0; pass--)
+        for (size_t i = 0; i < lib.size(); i++)
+            if (first[i] == pass && !lib[i].broken && !looks.count(lib[i].path)) todo.push_back(lib[i].path);
     for (auto& p : lib) {  // then measure bass punch for presets analysed by older versions
         auto it = looks.find(p.path);
         if (!p.broken && it != looks.end() && it->second.punch < 0) todo.push_back(p.path);

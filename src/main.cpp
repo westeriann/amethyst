@@ -45,6 +45,7 @@
 #include <functional>
 #include <iterator>
 #include <map>
+#include <memory>
 #include <random>
 #include <tuple>
 #include <set>
@@ -70,6 +71,7 @@ namespace {
 #include "app/10_ui.inc"               // interface: helpers, panels, keyboard editor, help
 #include "app/11_safety.inc"           // show safety: watchdog, safe preset, crash recovery
 #include "app/12_tests.inc"            // self-test, perf test, render test
+#include "app/13_mapping.inc"          // projection mapping: surfaces with their own presets
 
 }  // namespace
 
@@ -132,6 +134,8 @@ int main(int argc, char** argv) {
     loadLibrary();
     loadScenes();
     loadLooks();
+    loadPickStats();
+    mappingLoad();
     if (!extraFolder.empty()) S.folders.push_back(extraFolder);
     if (selftestDir.empty()) {  // the bundled presets folder next to the exe is always in the library
         std::string bundled = (fs::u8path(plat::exeDir()) / "presets").u8string();
@@ -420,7 +424,7 @@ int main(int argc, char** argv) {
             float a = renderW / (float)std::max(1, renderH), ca = cw / (float)std::max(1, ch);
             int w = cw, h = ch, x = 0, y = 0;
             if (a > ca) { h = (int)(cw / a); y = (ch - h) / 2; } else { w = (int)(ch * a); x = (cw - w) / 2; }
-            gfx.present(finalRT.tex, x, y, w, h, nullptr, false);
+            gfx.present(S.mapPreview && mappingNeeded() ? mappingTexture() : finalRT.tex, x, y, w, h, nullptr, false);
         }
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL2_NewFrame();
@@ -477,6 +481,7 @@ int main(int argc, char** argv) {
     ImGui::DestroyContext(uiCtx);
     for (auto& d : decks)
         for (auto& p : d.players) p.stop();
+    mappingShutdown();
     for (auto c : playerContexts) SDL_GL_DeleteContext(c);
     for (auto w : playerWindows) SDL_DestroyWindow(w);
     for (auto& o : outputs) SDL_DestroyWindow(o.win);

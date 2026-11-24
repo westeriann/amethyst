@@ -17,19 +17,137 @@ struct Smart {
 
 int onAirDeck() { return S.xfade < 0.5f ? 0 : 1; }
 
+// ---- how well a preset fits right now. Higher = better. Weighs, in order of how often they go wrong:
+// too bright for the moment, the wrong energy for the section, clashing with what is on screen, leaving
+// the song's colour palette, motion that ignores the tempo, and what you think of it (favourites, ratings,
+// presets you skip straight away, presets that just played).
+struct PickStat { int skips = 0, likes = 0; };
+std::unordered_map<std::string, PickStat> pickStats;
+std::vector<int> recentPicks;  // last auto picks, oldest first
+struct Vibe { float hue = 0, sat = 0, bright = 0.3f; bool set = false; } vibe;  // this song's palette so far
+int lastAutoPick = -1;
+std::string pickStatsPath() { return (fs::u8path(gAnalysisPath).parent_path() / "pickstats.ini").u8string(); }
+void savePickStats() {
+    std::ofstream f(fs::u8path(pickStatsPath()), std::ios::trunc);
+    for (auto& [p, s] : pickStats) f << p << "|" << s.skips << "|" << s.likes << "\n";
+}
+void loadPickStats() {
+    std::ifstream f(fs::u8path(pickStatsPath()));
+    std::string line;
+    while (std::getline(f, line)) {
+        auto p = splitBar(line);
+        if (p.size() == 3) pickStats[p[0]] = {std::atoi(p[1].c_str()), std::atoi(p[2].c_str())};
+    }
+}
+// called by loadPreset for manual loads while auto-pilot runs
+void notePickManual(int replaced, double shownFor, int chosen) {
+    if (replaced >= 0 && replaced == lastAutoPick && shownFor < 15) pickStats[lib[replaced].path].skips++;  // you skipped its pick
+    if (chosen >= 0) { auto& s = pickStats[lib[chosen].path]; s.likes = std::min(s.likes + 1, 20); }
+    savePickStats();
+}
+int moodNow() {
+    switch (structure.section()) {
+        case MusicStructure::Drop: return 2;
+        case MusicStructure::Breakdown: case MusicStructure::Intro: return 0;
+        case MusicStructure::Groove: return structure.energy() > 0.9f ? 2 : 1;
+        default: return 1;
+    }
+}
+// mood: 0 calm (breakdown), 1 groove, 2 drop; -1 = from the song section now
+int fitScore(int idx, const std::vector<int>& screen, int mood) {
+    if (idx < 0 || idx >= (int)lib.size()) return -(1 << 20);
+    if (mood < 0) mood = moodNow();
+    const std::string& path = lib[idx].path;
+    int sc = 0;
+    for (size_t k = 0; k < recentPicks.size(); k++)
+        if (recentPicks[k] == idx) sc -= 150 + 10 * (int)k;  // just played: the more recent, the worse
+    if (auto ps = pickStats.find(path); ps != pickStats.end()) sc += -110 * std::min(ps->second.skips, 4) + 25 * std::min(ps->second.likes, 4);
+    if (auto m = meta.find(path); m != meta.end()) {
+        if (m->second.fav) sc += 70;
+        if (m->second.rating > 0) sc += 35 * (m->second.rating - 3);
+    }
+    auto it = looks.find(path);
+    if (it == looks.end()) return sc - (S.journey ? 260 : 140);  // not analysed yet: a risk (bigger when a mood is set)
+    const Look& l = it->second;
+    int want = mood == 2 ? 1 : mood == 0 ? -1 : 0, ec = energyClass(l);
+    sc += ec == want ? 110 : std::abs(ec - want) == 1 ? 0 : -170;
+    // bright is fine; a white-out where you can't make anything out is not. Steep penalty only near white,
+    // plus a gentle one for very bright presets in breakdowns.
+    float whiteOut = mood == 2 ? 0.8f : 0.76f;
+    if (l.bright > whiteOut) sc -= (int)((l.bright - whiteOut) * 3500);
+    if (mood == 0 && l.bright > 0.65f) sc -= (int)((l.bright - 0.65f) * 500);
+    if (l.bright < 0.05f) sc -= 120;  // nearly black looks like a fault on a projector
+    float dSum = 0;
+    int dN = 0;
+    for (int o : screen) {
+        if (o < 0 || o == idx) continue;
+        auto oi = looks.find(lib[o].path);
+        if (oi == looks.end()) continue;
+        float d = lookDistance(l, oi->second);
+        dSum += std::min(d, 1.f), dN++;
+        if (d < 0.003f) sc -= 60;  // a near-copy of what is already showing
+    }
+    if (dN) sc -= (int)(dSum / dN * (mood == 2 ? 120 : 260));  // drops may jump further
+    if (vibe.set) {
+        Look v{vibe.hue, vibe.sat, vibe.bright, l.motion, -1};
+        sc -= (int)(std::min(lookDistance(l, v), 1.f) * 170);
+    }
+    float bpm = (float)tempo.bpm();
+    if (bpm > 0) {
+        float target = (0.12f + 0.3f * std::clamp((bpm - 80) / 100, 0.f, 1.f)) * (mood == 0 ? 0.6f : mood == 2 ? 1.3f : 1.f);
+        sc -= (int)(std::fabs(l.motion - target) * 160);
+    }
+    if (const Journey* j = journeyNow()) {  // the set's mood outweighs most other wishes
+        if (j->nh > 0) {
+            float d = 1;
+            for (int k = 0; k < j->nh; k++) {
+                float dh = std::fabs(l.hue - j->hues[k]);
+                d = std::min(d, std::min(dh, 1 - dh));
+            }
+            float vivid = std::clamp(l.sat * 2.5f, 0.f, 1.f);  // grey presets have no real colour to judge
+            sc -= (int)((std::max(0.f, d - 0.06f) * 4 * vivid + (1 - vivid) * 0.35f) * 380);
+        }
+        float bOff = l.bright - j->bright + (mood == 2 ? -0.08f : 0.f);  // drops may be a bit brighter
+        sc -= (int)(std::fabs(bOff) * (bOff > 0 ? 420 : 300));
+        sc -= (int)(std::fabs(l.sat - j->sat) * 220);
+        sc -= (int)(std::fabs(l.motion - j->motion) * 200);
+        if (j->energyBias) sc += ec == j->energyBias ? 70 : ec == -j->energyBias ? -90 : 0;
+    }
+    return sc;
+}
+void notePick(int idx) {
+    lastAutoPick = idx;
+    recentPicks.push_back(idx);
+    if (recentPicks.size() > 40) recentPicks.erase(recentPicks.begin());
+    auto it = looks.find(lib[idx].path);
+    if (it == looks.end()) return;
+    const Look& l = it->second;
+    if (!vibe.set) { vibe = {l.hue, l.sat, l.bright, true}; return; }
+    float dh = l.hue - vibe.hue;
+    dh -= std::round(dh);  // shortest way round the colour wheel
+    vibe.hue = vibe.hue + 0.25f * dh, vibe.hue -= std::floor(vibe.hue);
+    vibe.sat += 0.25f * (l.sat - vibe.sat), vibe.bright += 0.25f * (l.bright - vibe.bright);
+}
+// best of up to 80 candidates from the pool, with a little chance mixed in so it never gets predictable
 int smartPick(int energy) {
     AutoPickScope scope;
     int on = onAirDeck();
-    if (energy == 0) return S.shuffle ? pickRandom(decks[on].cur) : stepFrom(decks[on].cur, 1);
-    std::vector<int> c;
-    for (int i : pickPool()) {
+    if (energy == 0 && !S.shuffle) return stepFrom(decks[on].cur, 1);
+    const auto& pool = pickPool();
+    if (pool.empty()) return -1;
+    int mood = energy > 0 ? 2 : energy < 0 ? 0 : -1;
+    std::vector<int> screen = {decks[0].cur, decks[1].cur};
+    int best = -1, bestSc = -(1 << 30);
+    bool all = pool.size() <= 80;
+    for (size_t k = 0; k < std::min<size_t>(pool.size(), 80); k++) {
+        int i = all ? pool[k] : pool[rng() % pool.size()];
         if (lib[i].broken || i == decks[0].cur || i == decks[1].cur) continue;
-        auto it = looks.find(lib[i].path);
-        if (it == looks.end()) continue;
-        if (energyClass(it->second) == energy) c.push_back(i);
+        int sc = fitScore(i, screen, mood) + (int)(rng() % 50);
+        if (sc > bestSc) bestSc = sc, best = i;
     }
-    if (c.empty()) return pickRandom(decks[on].cur);
-    return c[std::uniform_int_distribution<size_t>(0, c.size() - 1)(rng)];
+    if (best < 0) best = pickRandom(decks[on].cur);
+    if (best >= 0) notePick(best);
+    return best;
 }
 
 bool releaseHeld(int d, double blendSecs) {
@@ -80,6 +198,7 @@ bool smartReady() {
     return S.autoDecks ? dk.pendingIdx < 0 && dk.cur == smart.idx : dk.heldIdx == smart.idx;
 }
 bool smartPrepare(int energy, int fireOn, double fireBeat, double blend, bool hard) {
+    AutoPickScope autoScope;  // this load is auto-pilot's, not a manual skip
     smartCancel();
     int on = onAirDeck(), d = S.autoDecks ? 1 - on : on;
     if (S.autoDecks ? xanim.active : decks[d].blending) return false;  // the spare is still in use
@@ -113,6 +232,11 @@ void smartFire(double t) {
     // drops: smash the two presets together with a layer blend for a bar instead of a plain cut
     bool smash = smart.hard && autoFxOn() && S.smartBlends && smart.energy > 0;
     int mode = smashModes[rng() % 4];
+    {
+        auto lb = [](int i) { auto it = i >= 0 ? looks.find(lib[i].path) : looks.end(); return it == looks.end() ? 0.3f : it->second.bright; };
+        int a = decks[onAirDeck()].cur, b = smart.idx;
+        if (lb(a) + lb(b) > 0.75f && (mode == MixAdd || mode == MixScreen)) mode = rng() % 2 ? MixLighten : MixDifference;
+    }
     if (S.autoDecks) {
         if (smash) {
             S.xfade = 0.5f;  // both decks full
@@ -151,6 +275,8 @@ void smartTick(double t) {
     bool active = S.autoOn && S.smartMix && !locked;
     for (auto& e : events) {
         autoFxEvent(e.type);
+        mappingEvent(e.type);
+        if (e.type == MusicStructure::SongChange || e.type == MusicStructure::SongStart) vibe.set = false;  // a new song may bring its own colours
         smart.lastEvent = MusicStructure::name(e.type);
         smart.lastEventAt = t;
         if (!active) continue;
@@ -206,7 +332,7 @@ void smartTick(double t) {
         double pre = sec == MusicStructure::Drop ? 1 : sec == MusicStructure::Groove ? 8 : 4;
         double land = structure.nextBoundary(beat + lead + pre, phraseBars());
         if (smartPrepare(0, 0, land - pre, beatsToSec(pre), false) && autoFxOn())
-            afx.transition = sec == MusicStructure::Drop ? (rng() % 2 ? TransZoom : TransGlitch) : smoothTransition();
+            afx.transition = pickTransition(sec == MusicStructure::Drop);
     }
 }
 

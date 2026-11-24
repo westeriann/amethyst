@@ -1,4 +1,5 @@
 // Kaleido tunnel: folds the picture into a rotating mirrored tunnel that rushes forward on the beat.
+// fit: calm 0.5 groove 0.7 drop 0.8
 void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     vec2 p = (fragCoord - 0.5 * iResolution.xy) / iResolution.y;
     float a = atan(p.y, p.x), r = length(p);

@@ -1,5 +1,6 @@
 // Part of Amethyst's main.cpp, which includes the parts in order (see the list there).
 
+void addMappingTests(const std::function<void(double, std::function<void()>)>& at);
 void writePng(const std::string& path, int w, int h, std::vector<unsigned char>& rgba) {
     static uint32_t crcTab[256];
     if (!crcTab[1])
@@ -541,6 +542,62 @@ void buildSelftest() {
     });
     at(2.0, [] {
         testNote("panic: safe=" + std::string(lib[decks[onAirDeck()].cur].path == S.safePreset ? "yes" : "no") + " from=" + std::to_string(wdBefore));
+    });
+    addMappingTests(at);
+    at(0.2, [] {  // Auto FX balance: 300 picks per moment, how evenly are the looks used?
+        const char* moodName[] = {"calm", "groove", "drop"};
+        for (int mood = 0; mood < 3; mood++) {
+            int cnt[kLookCount] = {}, rep = 0, prev = -1;
+            for (int k = 0; k < 300; k++) {
+                pickLookFor(mood);
+                cnt[afx.look]++;
+                rep += afx.look == prev;
+                prev = afx.look;
+            }
+            std::string s = std::string("autofx balance ") + moodName[mood] + ":";
+            for (int i = 0; i < kLookCount; i++) s += " " + std::to_string(cnt[i]);
+            testNote(s + " repeats=" + std::to_string(rep));
+        }
+        int tc[TransitionCount] = {};
+        for (int k = 0; k < 200; k++) tc[pickTransition(k % 2 == 0)]++;
+        std::string s = "transition balance:";
+        for (int i = 0; i < TransitionCount; i++) s += " " + std::to_string(tc[i]);
+        testNote(s);
+    });
+    at(0.5, [] {  // smart picking: what does it choose for each mood?
+        auto br = [](int i) { auto it = i >= 0 ? looks.find(lib[i].path) : looks.end(); return it == looks.end() ? -1.f : it->second.bright; };
+        for (int mood = 0; mood < 3; mood++) {
+            float sum = 0, mx = 0;
+            int n = 0;
+            for (int k = 0; k < 20; k++) {
+                int e = mood == 2 ? 1 : mood == 0 ? -1 : 0;
+                int i = smartPick(e);
+                float b = br(i);
+                if (b >= 0) sum += b, mx = std::max(mx, b), n++;
+            }
+            testNote("smart pick mood " + std::to_string(mood) + ": avg bright=" + std::to_string(n ? sum / n : -1) + " max=" + std::to_string(mx) +
+                     " analysed=" + std::to_string(n) + "/20");
+        }
+        float lsum = 0;
+        for (auto& [p, l] : looks) lsum += l.bright;
+        testNote("library avg bright=" + std::to_string(looks.empty() ? -1 : lsum / looks.size()));
+        recentPicks.clear();
+        vibe.set = false;
+        for (int jn : {1, 2, 4}) {  // journeys: Dark should pick darker presets than Happy
+            S.journey = jn;
+            float sum = 0, sat = 0;
+            int n = 0;
+            for (int k = 0; k < 20; k++) {
+                int i = smartPick(0);
+                auto it = i >= 0 ? looks.find(lib[i].path) : looks.end();
+                if (it != looks.end()) sum += it->second.bright, sat += it->second.sat, n++;
+            }
+            testNote(std::string("journey ") + journeyLabel() + ": avg bright=" + std::to_string(n ? sum / n : -1) + " avg sat=" + std::to_string(n ? sat / n : -1) +
+                     " analysed=" + std::to_string(n) + "/20");
+            recentPicks.clear();
+        }
+        S.journey = 0;
+        S.journey = 0;
     });
     at(1.0, [] { running = false; });
 }

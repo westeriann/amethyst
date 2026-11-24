@@ -79,6 +79,35 @@ void MusicStructure::vocalStep() {
     else if (vocalOn_ && vocalAmt_ < 0.25f) vocalOn_ = false;
 }
 
+// Hits are sudden jumps of a band's level over its own recent average. A snare band jump that comes
+// with a kick (bass jumping at the same time) is the kick's click, not a snare.
+void MusicStructure::percStep(float hat, float sn, float bass, float lvl, double beat, double dt) {
+    auto ema = [dt](float& st, float v, double tau) { st += (v - st) * (float)(1 - std::exp(-dt / tau)); };
+    hatEnv_ *= (float)std::exp(-dt / 0.08);
+    snEnv_ *= (float)std::exp(-dt / 0.15);
+    hatGap_ += dt, snGap_ += dt;
+    bool loud = lvl >= kQuiet;
+    bool kick = bass > 0.002f && bass > bassPrevHop_ * 1.35f;
+    if (loud && hatGap_ >= 0.06 && hat > hatM_ * 1.5f && hat > hatPrev_ * 1.2f && hat > lvl * 0.008f) {
+        hatEnv_ = std::max(hatEnv_, std::clamp((hat / (hatM_ + 1e-6f) - 1) / 1.5f, 0.3f, 1.f));
+        hatHits_++;
+        hatGap_ = 0;
+    }
+    if (loud && !kick && snGap_ >= 0.12 && sn > snM_ * 1.8f && sn > snPrev_ * 1.3f && sn > lvl * 0.05f) {
+        snEnv_ = std::max(snEnv_, std::clamp((sn / (snM_ + 1e-6f) - 1) / 2.f, 0.3f, 1.f));
+        snHits_++;
+        snGap_ = 0;
+    }
+    ema(hatM_, hat, 0.4);
+    ema(snM_, sn, 0.4);
+    hatPrev_ = hat, snPrev_ = sn, bassPrevHop_ = bass;
+    long long ib = (long long)std::floor(beat);
+    if (ib != rateBeat_) {
+        if (ib > rateBeat_ && ib - rateBeat_ < 8) hatRate_ += ((float)(hatHits_ - rateBase_) / (float)(ib - rateBeat_) - hatRate_) * 0.12f;
+        rateBeat_ = ib, rateBase_ = hatHits_;
+    }
+}
+
 void MusicStructure::trackChanged(double t, double beat) {
     emit(SongChange, beat, t);
     anchored_ = false;
@@ -101,6 +130,14 @@ void MusicStructure::feed(const float* s, size_t frames, double t, double beat, 
         vhpIn_ = m;
         vlp_ += 0.37f * (vhp_ - vlp_);
         vAcc_ += vlp_;
+        // percussion bands: hats = two one-pole high-passes at ~7 kHz; snares = 2x high-pass ~1 kHz + low-pass ~4 kHz
+        h1_ = 0.40f * (h1_ + m - h1In_), h1In_ = m;
+        h2_ = 0.40f * (h2_ + h1_ - h2In_), h2In_ = h1_;
+        accH_ += h2_ * h2_;
+        s1_ = 0.877f * (s1_ + m - s1In_), s1In_ = m;
+        s2_ = 0.877f * (s2_ + s1_ - s2In_), s2In_ = s1_;
+        sLp_ += 0.408f * (s2_ - sLp_);
+        accS_ += sLp_ * sLp_;
         if (++vN_ == 4) {
             vRing_[vHead_] = vAcc_ * 0.25f;
             vHead_ = (vHead_ + 1) & 1023;
@@ -109,8 +146,10 @@ void MusicStructure::feed(const float* s, size_t frames, double t, double beat, 
         }
         if (++accN_ == kHop) {
             double dt = kHop / kRate, off = (i + 1) / kRate;
-            hop((float)std::sqrt(accB_ / kHop), (float)std::sqrt(accA_ / kHop), t + off, beat + off * bps, bpm, dt);
-            accB_ = accA_ = 0;
+            float bassRms = (float)std::sqrt(accB_ / kHop), lvlRms = (float)std::sqrt(accA_ / kHop);
+            percStep((float)std::sqrt(accH_ / kHop), (float)std::sqrt(accS_ / kHop), bassRms, lvlRms, beat + off * bps, dt);
+            hop(bassRms, lvlRms, t + off, beat + off * bps, bpm, dt);
+            accB_ = accA_ = accH_ = accS_ = 0;
             accN_ = 0;
         }
     }

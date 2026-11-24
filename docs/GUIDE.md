@@ -11,6 +11,7 @@ control, OSC or the phone remote (all three under Control → MIDI, OSC & phone 
 - [Effects and custom shaders](#effects-and-custom-shaders)
 - [The visual preset editor](#the-visual-preset-editor)
 - [Render an audio file to video](#render-an-audio-file-to-video)
+- [Projection mapping](#projection-mapping)
 - [Going live: outputs, recording, Spout](#going-live-outputs-recording-spout)
 - [Show safety](#show-safety)
 - [Tempo, DJ gear and remote control](#tempo-dj-gear-and-remote-control)
@@ -55,6 +56,7 @@ Press **A** to turn it on. **Right-click the AUTO button** in the status bar for
 | Setting | What it does |
 |---|---|
 | **Stay in folder** | Only pick presets from this folder and its subfolders. The pool, folder and search filters at the top of the browser narrow it further. |
+| **Journey** | A mood for the whole set (below). |
 | Shuffle | Random order, or the order of the list. |
 | Mix decks A/B | Load the next preset on the hidden deck and crossfade, instead of blending on one deck. |
 | Change every | The longest it stays on one preset in quiet, steady parts. |
@@ -63,6 +65,27 @@ Press **A** to turn it on. **Right-click the AUTO button** in the status bar for
 | Smart blend modes on drops | Drops slam both presets together for a bar before the old one melts away. |
 | Build-up tease | How far the drop preset glows in during a build-up (0 = off). |
 | Calmer while vocals | Softer effects, no phrase flashes, and no switch in the middle of a sung line. |
+
+**Journey** gives the set a mood. Auto-pilot then picks presets that match it (colour, brightness,
+saturation, movement) and Auto FX favours effects that fit:
+
+| Mood | Feel |
+|---|---|
+| Dark | Deep, shadowy, little colour |
+| Happy | Bright and colourful: yellows, oranges, pinks, greens |
+| Dreamy | Soft pastels drifting slowly |
+| Aggressive | Hard, fast, red-hot |
+| Trippy | Saturated and swirling, every colour |
+| Chill | Calm blues, teals and greens |
+| Cosmic | Deep blues and violets, tunnels |
+| Warm | Sunset tones: amber, coral, magenta |
+| Wander | Moves to a related mood every two songs (or six minutes) |
+
+**How presets are picked.** Auto-pilot scores candidates for the moment: the right energy for the section,
+never a white-out you can't see anything in, colours that sit well with what is on screen and with the song so
+far, movement that suits the tempo, your favourites and ratings. Skip its pick within 15 seconds and it
+remembers that you didn't like it. All of this needs the preset analysis: if most presets in your folder aren't
+analysed yet, the AUTO menu says so and offers **Analyse now** (your auto-pilot folder goes first).
 
 **Smart mode** listens to the music:
 
@@ -85,6 +108,11 @@ When auto-pilot runs, Auto FX drives the effects from the same song detection: a
 and a one-bar strobe on drops; zoom, swirl and a speeding-up strobe through build-ups; a dark, colourless pause
 in fakeout gaps; soft trails in breakdowns; a new effect look every phrase; fades between songs.
 
+- 14 effect looks and 8 transition styles are each rated for calm parts, grooves and drops. Auto FX picks what
+  fits the section and spreads its choices, so nothing gets overused or repeats twice in a row.
+- **Groove texture**: hi-hats and snares drive small moves (shimmer, sway, breathing, echo pulses, colour steps)
+  so breakdowns, intros and house grooves stay interesting without going wild. It is strongest where the bass is
+  low and light on drops; set it with the **Groove texture** slider.
 - **Strength** sets how hard it pushes. **Flashes & strobes** off removes every flash, strobe and colour flip.
 - It adds on top of your own effects; it never turns your effects off.
 - With **Use custom shaders** on, it also picks your shader effects on drops and some phrases.
@@ -119,8 +147,12 @@ error, the error is shown and the last working version keeps running.
 | `iBass`, `iMid`, `iTreble`, `iLevel` | Band levels, 0…1 |
 | `iDrop` | 1 on a drop, fading out over a couple of beats |
 | `iVocal` | 0…1, how much singing is detected |
+| `iHat`, `iSnare` | 0…1 on each hi-hat / snare or clap hit, fading quickly |
 
-Six examples come with Amethyst (in the `shaders` folder next to `Amethyst.exe`): ripple, chroma-quake,
+Add a line like `// fit: calm 0.8 groove 0.6 drop 0.3` near the top so Auto FX knows where your effect belongs.
+
+Twelve come with Amethyst (in the `shaders` folder next to `Amethyst.exe`): halftone-pop, liquid-warp,
+prism-shards, hat-sparkle, radial-blur, glitch-slices, ripple, chroma-quake,
 kaleido-tunnel, vhs, bloom-glow, edge-neon. Copy one into your folder to start.
 
 ## The visual preset editor
@@ -144,9 +176,29 @@ Press **E** to edit the preset on the focused deck.
   faster than real time. Videos go to `Videos\Amethyst`.
 - The video / camera / Spout layer plays in real time, so it is left out of file renders.
 
+## Projection mapping
+
+**Output → Projection mapping** maps visuals onto real objects, with a different preset on each part.
+
+1. Open an output on the projector (**Send map to an output**, or set an output's **Shows** to *Projection map*).
+2. Add surfaces: **+ Rectangle**, **+ Free shape** (click the corners, click the first one to close), **+ Circle**,
+   or a **Template** (Door gives you wall, trim, door, two panels and a knob).
+3. Tick **Outlines** and drag the corners until each outline sits on the object. **Flash selected** blinks the
+   surface on the projector so you can find it. Ctrl snaps a corner to its neighbour; arrow keys nudge one pixel
+   (Shift: 10); double-click an edge to add a corner; right-click a corner to remove it.
+4. Choose what each surface **Shows**: its own preset, the main output, deck A or B, a colour, or the same picture
+   as another surface (free: use it for matching panels).
+5. Set its look (opacity, brightness, hue, saturation) and what it **Pulses with**: bass, hi-hats, snares or the beat.
+
+Surfaces lower in the list are drawn on top, so put the wall first and the knob last. With auto-pilot on, every
+surface with **Auto-pilot changes it** cuts to a new preset on drops, blends on breakdowns and new songs, and a
+few change each phrase. **Pick from** limits a surface to one folder. To place a preset by hand, right-click it in
+the browser → **Send to surface**. Up to 16 surfaces can run their own preset; the map is saved automatically.
+
 ## Going live: outputs, recording, Spout
 
 - **O** opens an output window on another screen (projector, LED wall). Drag its corners to fit a surface (corner pin).
+  For several surfaces with different presets, use [Projection mapping](#projection-mapping).
 - **F9** records the output to MP4 (`Videos\Amethyst`). **F12** sends it to OBS, Resolume or TouchDesigner via Spout.
 - **Q** switches render quality if a computer struggles.
 - Overlays (logo, text, video file, camera, Spout input) are in the Overlays window.
@@ -181,5 +233,7 @@ Press **E** to edit the preset on the focused deck.
 | A preset looks broken | Right-click it to check; **Hide broken** hides the ones the app has flagged. |
 | Auto-pilot picks presets you don't want | Right-click AUTO → **Stay in folder**, or narrow the browser's pool/folder. |
 | Flashes are too much | Right-click AUTO → untick **Flashes & strobes**. |
+| Auto-pilot picks off-vibe or blinding presets | Let the analysis finish (**Analyse now**); skip ones you dislike quickly; try a **Journey** mood. |
+| Projection map is slow | Fewer surfaces with their own preset; use **Same picture as...** for matching parts; **Q** for lower quality. |
 
 Settings and your library data live in `%APPDATA%\Amethyst`.

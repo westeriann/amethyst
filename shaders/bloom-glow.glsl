@@ -1,4 +1,5 @@
 // Bloom glow: bright parts bleed light, breathing with the bass.
+// fit: calm 0.9 groove 0.7 drop 0.6
 void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     vec2 uv = fragCoord / iResolution.xy;
     vec2 px = 1.0 / iResolution.xy;

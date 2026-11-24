@@ -1,4 +1,5 @@
 // Edge neon: outlines everything in glowing neon lines whose colour drifts with the beat; trails via iChannel1.
+// fit: calm 0.4 groove 0.7 drop 0.8
 void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     vec2 uv = fragCoord / iResolution.xy;
     vec2 px = 1.5 / iResolution.xy;

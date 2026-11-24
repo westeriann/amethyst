@@ -42,12 +42,25 @@ inline const char* blendModeName(int m) {
 
 // Inputs for custom (ShaderToy-style) shader effects.
 struct UserFxParams {
-    float time = 0, beat = 0, beatPhase = 0, bass = 0, mid = 0, treble = 0, level = 0, amount = 1, drop = 0, vocal = 0;
+    float time = 0, beat = 0, beatPhase = 0, bass = 0, mid = 0, treble = 0, level = 0, amount = 1, drop = 0, vocal = 0, hat = 0, snare = 0;
     int frame = 0;
+};
+
+// How one projection-mapping surface is drawn.
+struct SurfaceLook {
+    float opacity = 1, brightness = 0, hue = 0, saturation = 1, white = 0;
+    float solid[3] = {1, 1, 1};
+    bool useTex = true;
+    float uv[4] = {0, 0, 1, 1};  // part of the source to show: u0, v0, width, height
 };
 
 class Gfx {
 public:
+    // Projection mapping: fill triangles (x,y pairs in 0..1, top-left origin) of the bound target with `tex`,
+    // warped so the content's corners land on `corners` (TL,TR,BR,BL, same space). Alpha-blended.
+    void surface(unsigned tex, const float* tris, int verts, const float* corners, const SurfaceLook& look);
+    // A closed outline `px` pixels wide around a polygon (same space), for lining surfaces up.
+    void outline(const float* pts, int n, float r, float g, float b, float a, float px, int targetW, int targetH);
     // Compile a user effect: the file defines mainImage(out vec4, in vec2) like ShaderToy. 0 + err on failure.
     unsigned compileUser(const std::string& src, std::string& err);
     void userFx(RenderTarget& out, unsigned prog, unsigned src, unsigned prev, const UserFxParams& p);
@@ -63,5 +76,6 @@ public:
     void present(unsigned tex, int x, int y, int w, int h, const float* corners, bool grid, bool flipY = false);
 
 private:
+    unsigned surfVao_ = 0, surfVbo_ = 0, surfP_ = 0;
     unsigned vao_ = 0, transP_ = 0, mixP_ = 0, fxP_ = 0, layerP_ = 0, finalP_ = 0, presentP_ = 0;
 };

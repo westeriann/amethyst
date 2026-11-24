@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "structure.h"
+#include <cstdlib>
 #include "tempo.h"
 #define MINIAUDIO_IMPLEMENTATION
 #define MA_NO_DEVICE_IO
@@ -52,7 +53,10 @@ int main(int argc, char** argv) {
     int acc = 0;
     double lastBpmPrint = -100, vocalSum = 0;
     int vocalCols = 0, allCols = 0;
-    long long lastBar = -1;
+    long long lastBar = -1, hat0 = 0, sn0 = 0;
+    double hatBeat0 = 0;
+    const char* stepEnv = getenv("AN_STEP");
+    double step = stepEnv ? atof(stepEnv) : 30;
     for (size_t f0 = 0; f0 + blk <= frames; f0 += blk) {
         double t = f0 / 48000.0;
         const float* p = &s[f0 * 2];
@@ -75,6 +79,8 @@ int main(int argc, char** argv) {
             auto c = col[ms.section()];
             vline(x, H - 30, H - 10, c[0], c[1], c[2]);
             if (ms.vocalsOn()) vline(x, H - 8, H - 2, 80, 230, 200);
+            vline(x, 60, 60 + (int)(ms.hat() * 20), 120, 230, 255);    // hats: cyan ticks at the top
+            vline(x, 82, 82 + (int)(ms.snare() * 20), 255, 140, 230);  // snares: pink ticks under them
             vocalCols += ms.vocalsOn(), allCols++;
             vocalSum += ms.vocal();
             // bpm trace (60..200 mapped to rows 10..50)
@@ -98,9 +104,13 @@ int main(int argc, char** argv) {
             vline(x, 60, H - 30, r, g, b);
             vline(x + 1, 60, H - 30, r, g, b);
         }
-        if (t - lastBpmPrint >= 30) {
+        if (t - lastBpmPrint >= step) {
             lastBpmPrint = t;
-            printf("%7.2fs  tempo %.1f  conf %.1f  section %s\n", t - 1.0, bpm, tempo.confidence(), MusicStructure::name(ms.section()));
+            double nb = std::max(1.0, beat - hatBeat0);
+            printf("%7.2fs  tempo %.1f  conf %.1f  section %-9s  hats/beat %.2f (rate %.2f)  snares/bar %.2f  energy %.2f\n", t - 1.0, bpm,
+                   tempo.confidence(), MusicStructure::name(ms.section()), (ms.hatHits() - hat0) / nb, ms.hatsPerBeat(),
+                   4.0 * (ms.snareHits() - sn0) / nb, ms.energy());
+            hat0 = ms.hatHits(), sn0 = ms.snareHits(), hatBeat0 = beat;
         }
     }
     printf("VOCALS %.0f%% of the time (avg %.2f)\n", 100.0 * vocalCols / std::max(1, allCols), vocalSum / std::max(1, allCols));

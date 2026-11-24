@@ -329,7 +329,7 @@ void scanShaders() {
         r << "Put your own effects here as .glsl files. Write them like ShaderToy:\n\n"
              "  void mainImage(out vec4 fragColor, in vec2 fragCoord) { ... }\n\n"
              "Inputs: iChannel0 (the picture), iChannel1 (this effect's last output, for trails),\n"
-             "iResolution, iTime, iFrame, iBeat, iBeatPhase (0..1 within the beat), iBass, iMid, iTreble, iLevel,\n"
+             "iResolution, iTime, iFrame, iBeat, iBeatPhase (0..1 within the beat), iBass, iMid, iTreble, iLevel, iHat, iSnare,\n"
              "iDrop (1 on a drop, fading out), iVocal. Amethyst blends the result with the Amount slider.\n"
              "Saving a file reloads it instantly. The bundled examples are in the 'shaders' folder next to Amethyst.exe.\n";
     }
@@ -337,7 +337,23 @@ void scanShaders() {
     for (const std::string& dir : {plat::exeDir() + "\\shaders", userShaderDir()})
         for (fs::directory_iterator it(fs::u8path(dir), ec), end; !ec && it != end; it.increment(ec))
             if (it->path().extension() == ".glsl") found[it->path().stem().u8string()] = it->path().u8string();
-    for (auto& [n, p] : found) userShaders.push_back({n, p});
+    for (auto& [n, p] : found) {
+        UserShader u{n, p};
+        std::ifstream f(fs::u8path(p));
+        std::string line;
+        for (int k = 0; k < 6 && std::getline(f, line); k++) {  // "// fit: calm 0.8 groove 0.6 drop 0.3"
+            auto at = line.find("fit:");
+            if (line.rfind("//", 0) != 0 || at == std::string::npos) continue;
+            std::stringstream ss(line.substr(at + 4));
+            std::string key;
+            float v;
+            while (ss >> key >> v) {
+                int m = key == "calm" ? 0 : key == "groove" ? 1 : key == "drop" ? 2 : -1;
+                if (m >= 0) u.fit[m] = std::clamp(v, 0.f, 1.f);
+            }
+        }
+        userShaders.push_back(u);
+    }
 }
 bool ensureShader(UserShader& u) {
     long long st = fileStamp(u.path);
@@ -457,6 +473,7 @@ void renderFrame(double t, double dt) {
             double sinceDrop = b - afx.dropBeat;
             p.drop = sinceDrop >= 0 && sinceDrop < 8 ? (float)std::exp(-sinceDrop / 2) : 0.f;
             p.vocal = structure.vocal();
+            p.hat = structure.hat(), p.snare = structure.snare();
             p.frame = userFrame++;
             gfx.userFx(userRT[userIdx], userShaders[us].prog, fxRT[fxIdx].tex, userRT[prevU].tex, p);
             post = &userRT[userIdx];
@@ -470,6 +487,7 @@ void renderFrame(double t, double dt) {
         strobe = ph < 0.25 ? 1.f : 0.f;
     }
     gfx.finalize(finalRT, post->tex, std::max(blackAmt, afx.black), std::max({flashAmt, strobe, afx.white}));
+    if (mappingNeeded()) mappingRender(t, dt);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     if (S.spout) {
         if (!spoutNamed) { spout.SetSenderName("Amethyst"); spoutNamed = true; }

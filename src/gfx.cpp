@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <vector>
 
 namespace {
 
@@ -170,6 +171,40 @@ void main() {
     o = vec4(c, 1.0);
 })";
 
+const char* kSurfVs = R"(#version 330 core
+layout(location = 0) in vec2 pos;
+out vec2 p;
+void main() {
+    p = vec2(pos.x, 1.0 - pos.y);
+    gl_Position = vec4(pos.x * 2.0 - 1.0, 1.0 - pos.y * 2.0, 0.0, 1.0);
+})";
+
+const char* kSurfFs = R"(#version 330 core
+in vec2 p; out vec4 o;
+uniform sampler2D src; uniform mat3 hinv; uniform int useTex; uniform vec3 solid; uniform vec4 uvr;
+uniform float opacity, bright, hue, sat, white;
+vec3 hueRot(vec3 c, float a) {
+    const mat3 toY = mat3(0.299, 0.596, 0.211, 0.587, -0.274, -0.523, 0.114, -0.322, 0.312);
+    const mat3 toR = mat3(1.0, 1.0, 1.0, 0.956, -0.272, -1.106, 0.621, -0.647, 1.703);
+    vec3 y = toY * c;
+    float cs = cos(a), sn = sin(a);
+    y.yz = vec2(y.y * cs - y.z * sn, y.y * sn + y.z * cs);
+    return toR * y;
+}
+void main() {
+    vec3 c = solid;
+    if (useTex == 1) {
+        vec3 h = hinv * vec3(p, 1.0);
+        vec2 t = clamp(h.xy / h.z, 0.0, 1.0);
+        c = texture(src, uvr.xy + t * uvr.zw).rgb;
+    }
+    if (hue != 0.0) c = hueRot(c, hue * 6.2831853);
+    float l = dot(c, vec3(0.299, 0.587, 0.114));
+    c = mix(vec3(l), c, sat) + bright;
+    c = mix(c, vec3(1.0), white);
+    o = vec4(clamp(c, 0.0, 1.0), opacity);
+})";
+
 unsigned compileProgram(const char* vs, const char* fs, const char* name) {
     auto sh = [&](GLenum t, const char* s) {
         GLuint h = glCreateShader(t);
@@ -197,7 +232,7 @@ out vec4 amethystOut;
 uniform sampler2D iChannel0;  // the picture so far
 uniform sampler2D iChannel1;  // this effect's previous output (feedback)
 uniform vec3 iResolution;
-uniform float iTime, iBeat, iBeatPhase, iBass, iMid, iTreble, iLevel, iAmount, iDrop, iVocal;
+uniform float iTime, iBeat, iBeatPhase, iBass, iMid, iTreble, iLevel, iAmount, iDrop, iVocal, iHat, iSnare;
 uniform int iFrame;
 )";
 const char* kUserFooter = R"(
@@ -274,6 +309,14 @@ bool Gfx::init() {
     layerP_ = compileProgram(kLayerVs, kLayerFs, "layer");
     finalP_ = compileProgram(kVs, kFinalFs, "final");
     presentP_ = compileProgram(kVs, kPresentFs, "present");
+    surfP_ = compileProgram(kSurfVs, kSurfFs, "surface");
+    glGenVertexArrays(1, &surfVao_);
+    glGenBuffers(1, &surfVbo_);
+    glBindVertexArray(surfVao_);
+    glBindBuffer(GL_ARRAY_BUFFER, surfVbo_);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 8, nullptr);
+    glBindVertexArray(0);
     return mixP_ && fxP_ && layerP_ && finalP_ && presentP_;
 }
 
@@ -411,6 +454,8 @@ void Gfx::userFx(RenderTarget& out, unsigned prog, unsigned src, unsigned prev, 
     glUniform1f(glGetUniformLocation(prog, "iAmount"), p.amount);
     glUniform1f(glGetUniformLocation(prog, "iDrop"), p.drop);
     glUniform1f(glGetUniformLocation(prog, "iVocal"), p.vocal);
+    glUniform1f(glGetUniformLocation(prog, "iHat"), p.hat);
+    glUniform1f(glGetUniformLocation(prog, "iSnare"), p.snare);
     glUniform1i(glGetUniformLocation(prog, "iFrame"), p.frame);
     glDrawArrays(GL_TRIANGLES, 0, 3);
 }
@@ -458,3 +503,54 @@ unsigned Gfx::compileUser(const std::string& src, std::string& err) {
     return p;
 }
 
+
+void Gfx::surface(unsigned tex, const float* tris, int verts, const float* c, const SurfaceLook& l) {
+    if (verts < 3) return;
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glUseProgram(surfP_);
+    glBindVertexArray(surfVao_);
+    glBindBuffer(GL_ARRAY_BUFFER, surfVbo_);
+    glBufferData(GL_ARRAY_BUFFER, verts * 8, tris, GL_STREAM_DRAW);
+    bindTex(0, tex);
+    float q[8] = {c[6], 1 - c[7], c[4], 1 - c[5], c[2], 1 - c[3], c[0], 1 - c[1]};  // TL,TR,BR,BL -> GL BL,BR,TR,TL
+    double m[9];
+    squareToQuad(q, m);
+    float inv[9];
+    invert3(m, inv);
+    glUniform1i(glGetUniformLocation(surfP_, "src"), 0);
+    glUniformMatrix3fv(glGetUniformLocation(surfP_, "hinv"), 1, GL_TRUE, inv);
+    glUniform1i(glGetUniformLocation(surfP_, "useTex"), l.useTex && tex ? 1 : 0);
+    glUniform3f(glGetUniformLocation(surfP_, "solid"), l.solid[0], l.solid[1], l.solid[2]);
+    glUniform4f(glGetUniformLocation(surfP_, "uvr"), l.uv[0], l.uv[1], l.uv[2], l.uv[3]);
+    glUniform1f(glGetUniformLocation(surfP_, "opacity"), l.opacity);
+    glUniform1f(glGetUniformLocation(surfP_, "bright"), l.brightness);
+    glUniform1f(glGetUniformLocation(surfP_, "hue"), l.hue);
+    glUniform1f(glGetUniformLocation(surfP_, "sat"), l.saturation);
+    glUniform1f(glGetUniformLocation(surfP_, "white"), l.white);
+    glDrawArrays(GL_TRIANGLES, 0, verts);
+    glBindVertexArray(0);
+    glDisable(GL_BLEND);
+}
+
+void Gfx::outline(const float* pts, int n, float r, float g, float b, float a, float px, int W, int H) {
+    if (n < 2 || W <= 0 || H <= 0) return;
+    std::vector<float> v;
+    v.reserve(n * 12);
+    for (int i = 0; i < n; i++) {
+        float x0 = pts[i * 2] * W, y0 = pts[i * 2 + 1] * H, x1 = pts[(i + 1) % n * 2] * W, y1 = pts[(i + 1) % n * 2 + 1] * H;
+        float dx = x1 - x0, dy = y1 - y0, len = std::sqrt(dx * dx + dy * dy);
+        if (len < 1e-3f) continue;
+        float nx = -dy / len * px * 0.5f, ny = dx / len * px * 0.5f;
+        float ex = dx / len * px * 0.5f, ey = dy / len * px * 0.5f;  // overlap the joints a little
+        float q[8] = {x0 - ex + nx, y0 - ey + ny, x1 + ex + nx, y1 + ey + ny, x1 + ex - nx, y1 + ey - ny, x0 - ex - nx, y0 - ey - ny};
+        int k[6] = {0, 1, 2, 0, 2, 3};
+        for (int j : k) v.push_back(q[j * 2] / W), v.push_back(q[j * 2 + 1] / H);
+    }
+    SurfaceLook l;
+    l.useTex = false;
+    l.solid[0] = r, l.solid[1] = g, l.solid[2] = b;
+    l.opacity = a;
+    float c[8] = {0, 0, 1, 0, 1, 1, 0, 1};
+    surface(0, v.data(), (int)v.size() / 2, c, l);
+}

@@ -104,6 +104,7 @@ std::string autoFolderLabel() {
 void setAutoFolder(const std::string& path) {
     S.autoFolder = path;
     rebuildAutoView();
+    queueAnalysis();  // analyse that folder first
     upcoming = -1;
     saveSettings();
     if (path.empty()) toast(false, "Auto-pilot: any folder");
@@ -140,6 +141,39 @@ void drawAutoMenu() {
             ImGui::TextDisabled("%d presets to pick from", (int)autoView.size());
         }
     }
+    {   // journey: one mood for the whole set
+        ImGui::SetNextItemWidth(260);
+        std::string cur = journeyLabel();
+        if (S.journey == kJourneyCount + 1) cur += std::string(" (now ") + kJourneys[wanderMood % kJourneyCount].name + ")";
+        if (ImGui::BeginCombo("Journey", cur.c_str())) {
+            if (ImGui::Selectable("Off", S.journey == 0)) S.journey = 0;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("No mood: presets and effects follow the song only.");
+            ImGui::Separator();
+            for (int i = 0; i < kJourneyCount; i++) {
+                if (ImGui::Selectable(kJourneys[i].name, S.journey == i + 1)) S.journey = i + 1, vibe.set = false;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", kJourneys[i].desc);
+            }
+            ImGui::Separator();
+            if (ImGui::Selectable("Wander", S.journey == kJourneyCount + 1)) S.journey = kJourneyCount + 1, wanderNext(), vibe.set = false;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Travel through the moods: a new, related mood every two songs\n(or every six minutes in a long mix).");
+            ImGui::EndCombo();
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("A mood for the whole set. Auto-pilot picks presets that match it\n(colour, brightness, movement) and Auto FX favours effects that fit.");
+    }
+    {   // smart picking needs the analysis: say so when most of the pool is unknown
+        const auto& pool = S.autoFolder.empty() || autoView.empty() ? view : autoView;
+        int known = 0;
+        for (int i : pool) known += looks.count(lib[i].path) ? 1 : 0;
+        if (!pool.empty() && known < (int)pool.size() * 0.8) {
+            ImGui::TextColored(ImVec4(1.f, 0.75f, 0.35f, 1.f), "Only %d of %d presets here are analysed.", known, (int)pool.size());
+            ImGui::TextDisabled("Picks match the moment best once presets are analysed.");
+            if (!analyseNow && S.analysisOn) {
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Analyse now")) analyseNow = true;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Runs while you play too (small hitches possible), so best before the show.\nThis folder goes first. It stops by itself when done.");
+            }
+        }
+    }
     ImGui::Checkbox("Shuffle", &S.shuffle);
     ImGui::SameLine();
     ImGui::TextDisabled(S.shuffle ? "random order" : "in list order");
@@ -167,6 +201,15 @@ void drawAutoMenu() {
     ImGui::BeginDisabled(!S.autoFx);
     ImGui::SetNextItemWidth(160);
     ImGui::SliderFloat("Strength", &S.autoFxAmount, 0.f, 1.f, "%.2f");
+    ImGui::SetNextItemWidth(160);
+    ImGui::SliderFloat("Groove texture", &S.autoTexture, 0.f, 1.f, "%.2f");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Small moves on hi-hats and snares: shimmer, sway, breathing, echoes, colour steps.\n"
+                          "Strongest in breakdowns, intros and low-bass grooves (house, garage), light on drops.");
+    if (afx.texAmt > 0.01f) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", kTexNames[afx.tex]);
+    }
     ImGui::Checkbox("Flashes & strobes", &S.autoFxFlash);
     ImGui::Checkbox("Use custom shaders", &S.autoFxShaders);
     ImGui::EndDisabled();
@@ -188,6 +231,7 @@ void presetContextMenu(int idx) {
     ImGui::TextDisabled("%s", p.name.c_str());
     if (ImGui::MenuItem("Load to deck A")) loadPreset(0, idx, false);
     if (ImGui::MenuItem("Load to deck B")) loadPreset(1, idx, false);
+    mappingContextMenu(idx);
     ImGui::Separator();
     if (ImGui::MenuItem("Favorite", "Ctrl+D", m.fav)) { m.fav = !m.fav; saveLibrary(); }
     if (ImGui::MenuItem("Use as safe preset", nullptr, S.safePreset == p.path)) {
@@ -298,7 +342,8 @@ void drawMenuBar() {
             if (ImGui::MenuItem(label)) openOutput(i);
         }
         if (ImGui::MenuItem("New windowed output")) openOutput(-1);
-        if (ImGui::MenuItem("Outputs & projection mapping...", nullptr, S.showOutputs)) S.showOutputs = !S.showOutputs;
+        if (ImGui::MenuItem("Outputs & corner pin...", nullptr, S.showOutputs)) S.showOutputs = !S.showOutputs;
+        if (ImGui::MenuItem("Projection mapping (surfaces)...", nullptr, S.showMapping)) S.showMapping = !S.showMapping;
         ImGui::Separator();
         if (ImGui::MenuItem("Spout sender (to OBS, Resolume...)", "F12", S.spout)) setSpout(!S.spout);
         if (ImGui::MenuItem(recorder.active() ? "Stop recording" : "Record to MP4", "F9", recorder.active())) actions.invoke("record", true);
@@ -313,6 +358,7 @@ void drawMenuBar() {
             if (ImGui::MenuItem(kQuality[q].label, q == S.quality ? "Q" : nullptr, S.quality == q)) {
                 S.quality = q;
                 for (auto& d : decks) for (auto& p : d.players) p.setMesh(kQuality[q].meshW, kQuality[q].meshH);
+                mappingSetMesh(kQuality[q].meshW, kQuality[q].meshH);
             }
         ImGui::EndMenu();
     }
@@ -344,6 +390,7 @@ void drawMenuBar() {
         ImGui::MenuItem("Effects", "W", &S.showFx);
         ImGui::MenuItem("Overlays (logo, text, video)", nullptr, &S.showOverlays);
         ImGui::MenuItem("Outputs & mapping", nullptr, &S.showOutputs);
+        ImGui::MenuItem("Projection mapping", nullptr, &S.showMapping);
         ImGui::MenuItem("Setlists", nullptr, &S.showSetlists);
         ImGui::MenuItem("Scenes & show timeline", nullptr, &S.showScenes);
         ImGui::MenuItem("Modulation", nullptr, &S.showMod);
@@ -732,7 +779,8 @@ void drawMixer() {
             ImGui::SliderFloat("strength##afx", &S.autoFxAmount, 0.f, 1.f, "%.2f");
             ImGui::Checkbox("Auto FX flashes & strobes", &S.autoFxFlash);
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Off: Auto FX never flashes white, strobes or flips colours.\nEverything else (zoom, trails, mirrors...) still follows the song.");
-            ImGui::TextDisabled("Auto FX look: %s", kLookNames[afx.look]);
+            ImGui::TextDisabled("Auto FX look: %s   texture: %s (%.0f%%)   hats/beat %.1f", kLookNames[afx.look], kTexNames[afx.tex], afx.texAmt * 100,
+                                structure.hatsPerBeat());
         }
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Some songs drop for a bar or two, cut out, then drop for real.\nOn: the real drop gets its own fresh preset. Off: keep the one from the fake drop.");
         double hb = beatNow();
@@ -880,7 +928,8 @@ void drawOutputs() {
     if (ImGui::Button(recorder.active() ? "Stop recording" : "Record MP4")) actions.invoke("record", true);
     if (ImGui::CollapsingHeader("Lighting (Art-Net / DMX)", S.dmxOn ? ImGuiTreeNodeFlags_DefaultOpen : 0)) drawLightingTab();
     if (outputs.empty()) {
-        ImGui::TextWrapped("No outputs open. Add one per projector or screen. Each output can show the final mix or a single deck, and can be corner-pinned to fit angled screens.");
+        ImGui::TextWrapped("No outputs open. Add one per projector or screen. Each output can show the final mix, a single deck or the projection map, and can be corner-pinned to fit angled screens.");
+        if (ImGui::Button("Projection mapping (many surfaces, a preset each)...")) S.showMapping = true;
         ImGui::End();
         return;
     }
@@ -1787,6 +1836,7 @@ void drawUi() {
         if (keyboardOpen) drawKeyboard();
         if (S.showScenes) drawScenes();
         if (S.showMod) drawModulation();
+        if (S.showMapping) drawMapping();
         drawToasts(top);
     }
     drawHelp();

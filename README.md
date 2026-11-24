@@ -24,13 +24,17 @@ The old browser-based prototype lives in [`browser-version/`](browser-version/) 
 * Auto-pilot (in order or shuffled, optional A/B auto-mixing), launch quantize to beat / bar / 4 bars.
 * **Smart auto-mix** follows the song: it detects song start, end and change, breakdowns, build-ups and drops, switches on 8-bar phrase boundaries, cuts to an intense preset exactly on the drop (prepared ahead of time), and goes calm with a long blend in breakdowns. A fakeout detector spots drops that cut out after a bar or few and gives the real drop its own switch (optional, in the Mixer). Auto-pilot only picks from the presets your pool, folder and search filters show.
 * **Right-click the AUTO button** for every auto-pilot setting in one menu, including **Stay in folder**: auto-pilot then only picks presets from that folder and its subfolders.
+* **Smart preset picking**: auto-pilot scores every candidate for the moment: the right energy for the section, no white-outs, colours that sit well with what is on screen and with the song's palette so far, motion that suits the tempo, your favourites and ratings, and it learns from presets you skip straight away. Two bright presets never get added together on a drop.
+* **Journey mode** (AUTO menu): one mood for the whole set: Dark, Happy, Dreamy, Aggressive, Trippy, Chill, Cosmic or Warm, or **Wander** through them as the songs change. It steers both the presets and the effects.
 * **Smart blend modes**: on a drop, both presets slam together for a bar (add, screen, difference or lighten) before the old one melts away; build-up teases glow in with a screen blend.
 * **Vocal detection**: while someone sings, Auto FX eases off, phrase flashes pause and switches wait for the line to end. Vocals and Song energy are also modulation sources.
-* **Custom shader effects**: drop ShaderToy-style `.glsl` files (`mainImage`) into `Documents\Amethyst\Shaders`. They get the picture, their own last frame and live music inputs (`iBeat`, `iBass`, `iDrop`, `iVocal`...), reload when you save, and Auto FX can use them. Six examples are included.
+* **Custom shader effects**: drop ShaderToy-style `.glsl` files (`mainImage`) into `Documents\Amethyst\Shaders`. They get the picture, their own last frame and live music inputs (`iBeat`, `iBass`, `iDrop`, `iVocal`...), reload when you save, and Auto FX can use them, choosing ones that suit the part of the song. Twelve are included (ripple, chroma-quake, kaleido-tunnel, vhs, bloom-glow, edge-neon, halftone-pop, liquid-warp, prism-shards, hat-sparkle, radial-blur, glitch-slices), and `iHat` / `iSnare` give your own shaders the hi-hats and snares.
 * **Render an audio file to video** (File menu): pick a WAV, FLAC or MP3 and Amethyst renders it offline to MP4 at up to 4K60 with the music included, every frame kept, beat grid locked from the first frame, often faster than real time.
 * **Show safety**: a watchdog skips presets that go black, freeze or crawl while music plays; a **Safe preset now** panic action (right-click a preset to choose it); if Amethyst ever crashes it restarts itself and marks the preset that caused it as broken.
 * **Musical blends**: smart auto-mix times every blend to the song. Phrase changes start two bars early so the new preset fully lands on the downbeat, breakdowns get a long soft four-bar blend, switches during a drop take one punchy beat, and drops are hard cuts. During a build-up the drop preset slowly fades in (Build-up tease) and then snaps to full on the drop. Blends ease in and out gently.
 * **Auto FX**: while auto-pilot runs, every effect follows the song: flash, zoom punch, RGB burst and strobe on drops; zoom, swirl, RGB split and a speeding-up strobe through build-ups; dark, colourless tension in fakeout gaps; soft trails in breakdowns; a new effect look (kaleidoscope, mirrors, tunnel trails, beat pixels, colour cycle, swirl...) each phrase; fades between songs; transition styles that fit the moment. Strength slider, and a switch to turn off all flashes and strobes.
+  14 effect looks and 8 transition styles, each rated for calm parts, grooves and drops; Auto FX picks what fits the section and spreads its choices so no effect gets overused.
+* **Groove texture**: hi-hats and snares are detected separately, and drive small moves (shimmer, side-to-side sway, breathing, echo pulses, colour steps) so breakdowns, intros and house or garage grooves stay alive without going over the top.
 * **Bass punch analysis**: each preset is measured for how hard it hits on kick drums, so drop presets really slam and breakdown presets stay calm (the Intense / Calm pools use it too).
 * Beat detection tuned on real drum & bass, dubstep, house and UKG: locks onto the right tempo (e.g. 174 for DnB) and holds it instead of jumping between half, double or 2/3 speed.
 * Presets compile on background threads, so clicking a preset or using the phone remote never stalls the picture.
@@ -44,8 +48,9 @@ The old browser-based prototype lives in [`browser-version/`](browser-version/) 
   (static or scrolling ticker). Drop an image or video onto the window to use it.
 
 **Output**
-* Any number of output windows, each on any display, showing the final mix or a single deck, with
-  **corner-pin projection mapping** and a test grid (Outputs & mapping panel).
+* Any number of output windows, each on any display, showing the final mix, a single deck or the projection map, with
+  corner pin and a test grid (Outputs & mapping panel).
+* **Projection mapping** (Output > Projection mapping): draw any number of surfaces (rectangles with perspective, free shapes, circles) and give each its **own preset**, the main output, a deck, a colour, or the same picture as another surface. Each surface can pulse with the bass, hi-hats, snares or beat; auto-pilot gives them new presets on drops and phrases. Templates for a door (wall, trim, door, panels, knob), a 3x3 grid and a cube corner; outlines and a blinking "find it" mode for lining up on the real object.
 * **Spout** sender "Amethyst" for OBS, Resolume, TouchDesigner (F12).
 * **MP4 recording** (H.264, 24/30/60 fps) to `Videos\Amethyst` (F9).
 
@@ -60,7 +65,7 @@ The old browser-based prototype lives in [`browser-version/`](browser-version/) 
 **Modulation** (Y)
 * Route bass / mids / treble / level / beat pulse or tempo-synced LFOs (sine, saw, square, random) to zoom,
   rotate, swirl, hue, saturation, contrast, brightness, RGB split, trails, pixelate, kaleidoscope, crossfader or
-  overlay opacity. One-click starters: kick -> zoom pulse, hats -> RGB split, slow hue drift.
+  overlay opacity. Hi-hat and snare hits are sources too. One-click starters: kick -> zoom pulse, hats -> RGB split, slow hue drift.
 
 **DJ link** (Control > DJ link)
 * Connects to **Denon Engine OS** gear over the network (StageLinQ): follows the on-air deck's BPM and beat,

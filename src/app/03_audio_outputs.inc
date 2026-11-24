@@ -92,6 +92,7 @@ bool pumpAudio() {
     size_t off = n > maxS ? n - maxS : 0;
     for (auto& d : decks)
         for (auto& p : d.players) p.pushAudio(s + off * 2, n - off);
+    mappingPushAudio(s + off * 2, n - off);
     thumbs.pushAudio(s, n);
     return hit;
 }
@@ -150,6 +151,7 @@ unsigned outputTexture(int source) {
         case 1: return decks[0].outTex;
         case 2: return decks[1].outTex;
         case 3: return mixRT.tex;
+        case 4: return mappingTexture();
         default: return finalRT.tex;
     }
 }
