@@ -3655,6 +3655,7 @@ void drawMenuBar() {
     if (ImGui::BeginMenu("Help")) {
         if (ImGui::MenuItem("Keyboard shortcuts", chordsFor("help").empty() ? nullptr : chordsFor("help")[0].c_str())) helpOpen = true;
         if (ImGui::MenuItem("Customize keyboard layout...", chordsFor("keyboard").empty() ? nullptr : chordsFor("keyboard")[0].c_str())) keyboardOpen = true;
+        if (ImGui::MenuItem("User guide")) plat::openPath("https://github.com/westeriann/amethyst/blob/main/docs/GUIDE.md");
         ImGui::TextDisabled("projectM %s", projectm_get_version_string());
         ImGui::EndMenu();
     }

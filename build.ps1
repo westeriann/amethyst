@@ -34,6 +34,7 @@ foreach ($d in $dlls) {
 }
 Copy-Item (Join-Path $root 'presets') (Join-Path $dist 'presets') -Recurse
 Copy-Item (Join-Path $root 'shaders') (Join-Path $dist 'shaders') -Recurse
+Copy-Item (Join-Path $root 'docs/GUIDE.md') (Join-Path $dist 'GUIDE.md')
 New-Item -ItemType Directory -Force (Join-Path $dist 'textures') | Out-Null
 New-Item -ItemType Directory -Force (Join-Path $dist 'licenses') | Out-Null
 Copy-Item (Join-Path $root 'third_party\projectm\LICENSE.txt') (Join-Path $dist 'licenses\projectM-LGPL-2.1.txt')
