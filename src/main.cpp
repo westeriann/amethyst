@@ -1722,6 +1722,8 @@ void loadLooks() {
                        p.size() == 6 ? (float)std::atof(p[5].c_str()) : -1.f};
     }
 }
+int analysisQueued = 0;
+bool analyseNow = false;  // run the analysis even while performing (button in the browser)
 void queueAnalysis() {
     std::vector<std::string> todo;
     for (auto& p : lib)
@@ -1731,6 +1733,7 @@ void queueAnalysis() {
         if (!p.broken && it != looks.end() && it->second.punch < 0) todo.push_back(p.path);
     }
     thumbs.analysisEnabled = S.analysisOn;
+    analysisQueued = (int)todo.size();
     thumbs.queueAnalysis(std::move(todo));
 }
 void intakeAnalysis(double t) {
@@ -2215,7 +2218,7 @@ void drawOverlays(RenderTarget& rt, double t) {
     const float W = (float)rt.w, H = (float)rt.h;
     auto px2ndc = [&](float x, float y) { return ImVec2(x / W * 2 - 1, 1 - y / H * 2); };
     // video layer
-    if (S.videoOn && S.layerSource == 2 && receiveSpout()) {
+    if (S.videoOn && !rj.active && S.layerSource == 2 && receiveSpout()) {
         rt.bind();
         float va = spoutRxW / (float)std::max(1, spoutRxH), ra = W / H, sx = 1, sy = 1;
         if (S.videoFit == 0) { if (va > ra) sx = va / ra; else sy = ra / va; }
@@ -2223,7 +2226,7 @@ void drawOverlays(RenderTarget& rt, double t) {
         gfx.layer(spoutRxTex, -sx, -sy, sx, sy, modOut.videoOpacity, true, S.videoBlend);
     }
     rt.bind();
-    if (S.videoOn && S.layerSource != 2 && video.active()) {
+    if (S.videoOn && !rj.active && S.layerSource != 2 && video.active()) {
         int w, h;
         bool bu;
         if (video.latest(videoSerial, videoBuf, w, h, bu)) {
@@ -2346,8 +2349,21 @@ bool startRenderJob(std::vector<float> pcm, const std::string& src, const std::s
     if (rj.active || recorder.active()) { toast(true, "Stop the current recording first"); return false; }
     std::error_code ec;
     fs::create_directories(fs::u8path(out).parent_path(), ec);
+    // Some H.264 encoders refuse 4K or 60 fps: step down until one works and say what was used.
     std::string err;
-    if (!recorder.start(out, w, h, fps, err, true)) { rj.lastErr = err; toast(true, "Render failed: %s", err.c_str()); return false; }
+    int tries[][3] = {{w, h, fps}, {w, h, 30}, {2560, 1440, fps}, {2560, 1440, 30}, {1920, 1080, fps}, {1920, 1080, 30}, {1280, 720, 30}};
+    bool started = false;
+    int usedW = w, usedH = h, usedFps = fps;
+    for (auto& tr : tries) {
+        if (tr[0] > w || tr[1] > h || tr[2] > fps) continue;
+        if (recorder.start(out, tr[0], tr[1], tr[2], err, true)) {
+            started = true, usedW = tr[0], usedH = tr[1], usedFps = tr[2];
+            break;
+        }
+    }
+    if (!started) { rj.lastErr = err; toast(true, "Render failed: %s", err.c_str()); return false; }
+    if (usedW != w || usedFps != fps) toast(true, "This PC's video encoder can't do %dx%d @ %d fps - rendering %dx%d @ %d fps instead", w, h, fps, usedW, usedH, usedFps);
+    fps = usedFps;
     rj = RenderJob{};
     rj.pcm = std::move(pcm);
     rj.src = src, rj.out = out, rj.w = recorder.width(), rj.h = recorder.height(), rj.fps = fps, rj.useAuto = useAuto;
@@ -2463,6 +2479,7 @@ void drawRenderWindow() {
             if (!o.empty()) snprintf(renderOut, sizeof renderOut, "%s", o.c_str());
         }
         ImGui::TextDisabled("Renders offline: every frame is kept, the music is added to the video.");
+        if (S.videoOn) ImGui::TextColored(ImVec4(1, 0.72f, 0.3f, 1), "The video / camera / Spout layer plays in real time, so it is left out of file renders.");
         if (ImGui::Button("Render", ImVec2(120, 0))) {
             if (startRenderJob(std::move(renderPickPcm), renderPick, renderOut, kRenderRes[renderRes][0], kRenderRes[renderRes][1],
                                renderFps ? 60 : 30, renderUseAuto))
@@ -2476,7 +2493,8 @@ void drawRenderWindow() {
     ImGui::End();
 }
 
-std::string userShaderDir() { return plat::documentsDir() + "\\Amethyst\\Shaders"; }
+std::string userShaderDir() { return selftestDir.empty() ? plat::documentsDir() + "\\Amethyst\\Shaders" : selftestDir + "\\Shaders"; }
+int shaderCompiles = 0;  // successful (re)compiles, for the hot-reload test
 long long fileStamp(const std::string& p) {
     std::error_code ec;
     auto t = fs::last_write_time(fs::u8path(p), ec);
@@ -2516,6 +2534,7 @@ bool ensureShader(UserShader& u) {
         if (u.prog) glDeleteProgram(u.prog);
         u.prog = p;
         u.err.clear();
+        shaderCompiles++;
     } else {
         u.err = err;
         toast(true, "Shader %s: %s", u.name.c_str(), err.substr(0, 160).c_str());
@@ -3696,9 +3715,37 @@ void drawBrowser(float top, float bottom) {
     ImGui::SameLine();
     {
         int pend = thumbs.analysisPending();
-        if (pend > 0 && S.analysisOn) ImGui::TextDisabled("analysing %d...", pend);
-        else ImGui::TextDisabled("%d analysed", (int)looks.size());
-        if (pend > 0 && S.analysisOn && !thumbs.analysisEnabled) { ImGui::SameLine(); ImGui::TextDisabled("(paused while performing)"); }
+        if (pend > 0 && S.analysisOn) {
+            // progress + time left, from the rate measured while it was running
+            static int lastPend = -1;
+            static double rate = 0, lastT = 0;
+            double tn = now();
+            if (lastPend < 0 || pend > lastPend) lastPend = pend, lastT = tn;
+            else if (tn - lastT > 5) {
+                double r = (lastPend - pend) / (tn - lastT);
+                if (thumbs.analysisEnabled && r > 0) rate = rate > 0 ? rate * 0.7 + r * 0.3 : r;
+                lastPend = pend, lastT = tn;
+            }
+            int total = std::max(pend, analysisQueued);
+            ImGui::SetNextItemWidth(110);
+            char ov[64];
+            if (rate > 0) snprintf(ov, sizeof ov, "%d left, ~%d min", pend, (int)std::ceil(pend / rate / 60));
+            else snprintf(ov, sizeof ov, "%d left", pend);
+            ImGui::ProgressBar(total ? 1.f - pend / (float)total : 0.f, ImVec2(170, 0), ov);
+        } else {
+            ImGui::TextDisabled("%d analysed", (int)looks.size());
+        }
+        if (pend > 0 && S.analysisOn && !thumbs.analysisEnabled && !analyseNow) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("(paused while performing)");
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Analyse now")) analyseNow = true;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Run the analysis even while performing. It can cause small hitches,\nso use it when the show is not live. Turns itself off when finished.");
+        } else if (analyseNow) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Pause analysis")) analyseNow = false;
+            if (pend == 0) analyseNow = false;
+        }
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Presets are analysed in the background (colour, brightness, motion)\nfor the colour/energy pools and \"More like this\". Right-click to pause.");
         if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) { S.analysisOn = !S.analysisOn; thumbs.analysisEnabled = S.analysisOn; }
     }
@@ -5039,14 +5086,16 @@ void drawUi() {
 
 // ===================================================================== self-test
 std::string selftestDir;
+std::string gDataDir;  // where settings and the session file live
 bool wdTestMode = false, recoveredStart = false;
+std::string crashTestDir;  // --crashtest: crash on purpose and check the automatic restart
 int wdBefore = -1;
 // ===================================================================== show safety
 // A watchdog samples the output twice a second (async readback, no stall). If music is playing but
 // the picture has gone black or stopped moving for 8 s, the preset is skipped for the safe preset;
 // if that does not help, the app restarts itself. Presets that drag the frame rate down get skipped.
 // A session file remembers what was loading, so a preset that crashed the app is marked broken.
-std::string sessionPath() { return plat::appDataDir() + "\\session.txt"; }
+std::string sessionPath() { return gDataDir + "\\session.txt"; }
 std::string crashedPreset;  // set at startup when the last session ended in a crash
 bool lastRunCrashed = false;
 void sessionMark(const std::string& loading) {
@@ -5165,7 +5214,7 @@ void watchdogTick(double t, double dt) {
         return;
     }
     wd.fallbackAt = t;
-    goSafe(on, dark ? "went black" : "froze", true);
+    goSafe(on, dark ? "stayed dark" : "froze", !dark);  // dark can be on purpose: skip it, but only mark frozen ones broken
 }
 
 
@@ -5322,6 +5371,7 @@ void testRenderCheck() {  // virtual seconds: the clock follows the render
                  std::to_string(rj.lastSecs) + " wall=" + std::to_string(rj.lastWall) + " size=" + std::to_string(ec ? 0 : size) + " " + rj.lastErr);
     }
 bool renderTestOnly = false;
+int hotBase = 0;
 void buildSelftest() {
     double t = 2.5;
     auto at = [&](double dt, std::function<void()> f) { t += dt; testSteps.push_back({t, std::move(f)}); };
@@ -5653,6 +5703,33 @@ void buildSelftest() {
     });
     at(1.0, [] { pendingShot = "25-shader-kaleido-tunnel"; S.userShader = "edge-neon"; });
     at(1.0, [] { pendingShot = "26-shader-edge-neon"; S.userShader.clear(); });
+    at(0.2, [] {  // hot reload: write a shader, break it, fix it - the running effect follows the file
+        std::ofstream(fs::u8path(userShaderDir() + "\\zz-hot.glsl")) << "void mainImage(out vec4 c, in vec2 p) { c = vec4(1.0, 0.0, 0.0, 1.0); }\n";
+        scanShaders();
+        S.userShader = "zz-hot";
+        S.userShaderAmount = 1;
+        hotBase = shaderCompiles;
+    });
+    at(1.5, [] {
+        testNote("hot reload 1 (red): compiled=" + std::to_string(shaderCompiles - hotBase));
+        std::ofstream(fs::u8path(userShaderDir() + "\\zz-hot.glsl")) << "void mainImage(out vec4 c, in vec2 p) { c = vec4(0.0, 1.0, 0.0, 1.0) }\n";  // missing ;
+        std::error_code ec;  // make sure the timestamp moves even on coarse file systems
+        fs::last_write_time(fs::u8path(userShaderDir() + "\\zz-hot.glsl"), fs::file_time_type::clock::now() + std::chrono::seconds(2), ec);
+    });
+    at(2.0, [] {
+        int i = shaderIndex("zz-hot");
+        testNote("hot reload 2 (broken): error shown=" + std::string(i >= 0 && !userShaders[i].err.empty() ? "yes" : "no") +
+                 " still running old=" + std::string(i >= 0 && userShaders[i].prog ? "yes" : "no"));
+        std::ofstream(fs::u8path(userShaderDir() + "\\zz-hot.glsl")) << "void mainImage(out vec4 c, in vec2 p) { c = vec4(0.0, 1.0, 0.0, 1.0); }\n";
+        std::error_code ec;
+        fs::last_write_time(fs::u8path(userShaderDir() + "\\zz-hot.glsl"), fs::file_time_type::clock::now() + std::chrono::seconds(4), ec);
+    });
+    at(2.0, [] {
+        int i = shaderIndex("zz-hot");
+        testNote("hot reload 3 (fixed): compiled=" + std::to_string(shaderCompiles - hotBase) + " error=" + (i >= 0 ? userShaders[i].err : std::string("?")));
+        pendingShot = "27-shader-hot-reload-green";
+    });
+    at(0.5, [] { S.userShader.clear(); });
     at(0.5, [] {  // stay-in-folder lock
         buildAutoFolders();
         std::string pick;
@@ -5726,9 +5803,12 @@ int main(int argc, char** argv) {
         else if (a == "--add-folder" && i + 1 < argc) extraFolder = argv[++i];
         else if (a == "--recovered") recoveredStart = true;
         else if (a == "--rendertest" && i + 1 < argc) { selftestDir = argv[++i]; renderTestOnly = true; }
+        else if (a == "--crashtest" && i + 1 < argc) crashTestDir = argv[++i];
     }
     if (selftestDir.empty()) migrateLegacy();
-    std::string base = selftestDir.empty() ? plat::appDataDir() : selftestDir;
+    std::string base = !crashTestDir.empty() ? crashTestDir : selftestDir.empty() ? plat::appDataDir() : selftestDir;
+    gDataDir = base;
+    if (!crashTestDir.empty()) fs::create_directories(fs::u8path(crashTestDir));
     if (!selftestDir.empty()) {
         fs::create_directories(fs::u8path(selftestDir));
         for (const char* f : {"settings.ini", "library.ini", "layout.ini", "scenes.ini", "analysis.ini"}) { std::error_code ec; fs::remove(fs::u8path(selftestDir + "\\" + f), ec); }
@@ -5960,7 +6040,7 @@ int main(int argc, char** argv) {
             // outputs open, fullscreen, interface hidden, Spout or recording running.
             bool performing = !outputs.empty() || (SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN_DESKTOP) || S.uiHidden || S.spout ||
                               recorder.active();
-            thumbs.analysisEnabled = S.analysisOn && !performing && t - slowSince > 3.0;
+            thumbs.analysisEnabled = S.analysisOn && ((!performing && t - slowSince > 3.0) || analyseNow);
         }
         updateLeds(t);
         // crossfade animation
@@ -6002,6 +6082,17 @@ int main(int argc, char** argv) {
         renderFrame(t, dt);
         if (rjAdvance) captureRenderFrame();
         if (!rj.active) watchdogTick(t, dt);
+        if (!crashTestDir.empty() && t - startTime > 4) {
+            if (recoveredStart) {  // we are the restarted copy: report and leave
+                std::ofstream(fs::u8path(crashTestDir + "\\recovered.txt")) << "restarted after crash, presets=" << lib.size() << "\n";
+                running = false;
+            } else {
+                std::ofstream(fs::u8path(crashTestDir + "\\crashing.txt")) << "about to crash\n";
+                plat::installCrashRestart(true);
+                volatile int* bad = nullptr;
+                *bad = 42;  // the crash
+            }
+        }
         {
             static double lastSave = t;
             if (selftestDir.empty() && t - lastSave > 60) { lastSave = t; saveSettings(); }  // a crash loses little

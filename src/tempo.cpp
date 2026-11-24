@@ -31,6 +31,7 @@ struct Tempo::Impl {
     double pendingBpm = 0;
     int pendingVotes = 0;
     bool locked = false;
+    double strongAvg = 0;  // typical onset strength of this song
     std::vector<double> acc;  // accumulated tempo scores
 
     std::vector<double> taps;
@@ -54,6 +55,12 @@ struct Tempo::Impl {
         double mean = 0;
         for (int i = 0; i < n; i++) { x[i] = odAt(n - 1 - i); mean += x[i]; }
         mean /= n;
+        // how strong the rhythm is right now vs. this song so far: drumless breakdowns barely move the lock
+        double recent = 0;
+        for (int i = std::max(0, n - 300); i < n; i++) recent += x[i];
+        recent /= std::min(n, 300);
+        strongAvg = strongAvg <= 0 ? recent : strongAvg + (recent - strongAvg) * 0.02;
+        double w = std::clamp(recent / std::max(1e-6, strongAvg), 0.05, 1.5);
         for (auto& v : x) v = (float)(v - mean);
         const int maxL = std::min(n - 50, 360);
         std::vector<double> acf(maxL + 2, 0.0);
@@ -80,7 +87,7 @@ struct Tempo::Impl {
         double sum = 0;
         int best = 0;
         for (int i = 0; i < kBins; i++) {
-            acc[i] = acc[i] * 0.96 + sc[i] / mx;
+            acc[i] = acc[i] * (1 - 0.04 * w) + w * sc[i] / mx;
             sum += acc[i];
         }
         auto prior = [](double b) { double d = std::log2(b / 140.0); return std::exp(-0.5 * d * d / (0.6 * 0.6)); };
@@ -103,12 +110,19 @@ struct Tempo::Impl {
             int i = (int)std::lround((b - kMinBpm) / kStep);
             return i >= 0 && i < kBins ? acc[i] * prior(b) : 0.0;
         };
+        // triplet-heavy music makes 4:3, 3:2 and 2:1 neighbours of the real tempo look good for a while:
+        // once locked, those need far stronger and longer evidence than an unrelated tempo
+        auto related = [&](double f) {
+            for (double q : {4.0 / 3, 3.0 / 4, 3.0 / 2, 2.0 / 3, 2.0, 0.5})
+                if (std::fabs(f / bpm / q - 1) < 0.03) return true;
+            return false;
+        };
         if (std::fabs(found - bpm) / bpm < 0.02) {
             setTempoKeepPhase(bpm + (found - bpm) * 0.3, now);
             pendingVotes = 0;
-        } else if (valueAt(found) > valueAt(bpm) * 1.3 || !locked) {
+        } else if (!locked || valueAt(found) > valueAt(bpm) * (related(found) ? 2.0 : 1.3)) {
             if (pendingBpm > 0 && std::fabs(found - pendingBpm) / pendingBpm < 0.02) {
-                if (++pendingVotes >= (locked ? 10 : 2)) { setTempoKeepPhase(found, now); pendingVotes = 0; pendingBpm = 0; locked = true; }
+                if (++pendingVotes >= (!locked ? 2 : related(found) ? 24 : 10)) { setTempoKeepPhase(found, now); pendingVotes = 0; pendingBpm = 0; locked = true; }
             } else {
                 pendingBpm = found;
                 pendingVotes = 1;
@@ -269,5 +283,6 @@ void Tempo::restart(double bpmHint) {
     I.lastEstimate = 0;
     I.anchorBeat = 0, I.anchorTime = 0;
     I.locked = bpmHint > 0;
+    I.strongAvg = 0;
     I.bpm = bpmHint > 0 ? bpmHint : 120;
 }
