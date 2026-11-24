@@ -120,6 +120,11 @@ Settings, key map, MIDI maps, scenes, analysis cache and layout live in `%APPDAT
 
 ## Build
 
+The app code is `src/main.cpp` plus its parts in `src/app/` (settings, library & decks, audio & outputs, live features,
+analysis, Auto FX, auto-mix, rendering, input, interface, show safety, tests). `tools/analyze.cpp` is an offline
+test bench for the beat and song-structure detection: `amethyst-analyze song.flac timeline.png`.
+
+
 Needs MSYS2 at `C:\msys64` with UCRT64 packages: `gcc cmake ninja SDL2 glew miniaudio`. Then `.\build.ps1`.
 Vendored in `third_party/`: prebuilt libprojectM 4.2 (see `BUILD-INFO.txt`), Dear ImGui, Spout2 SDK,
 Ableton Link (+ asio), stb_image.
